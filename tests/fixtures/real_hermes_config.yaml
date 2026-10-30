@@ -1,0 +1,53 @@
+# Sanitized from a real Hermes config.yaml: key structure and layout kept, names and values replaced.
+_config_version: 51
+model:
+  default: fixture-model
+  provider: fixture
+# secrets_hook:
+#   command: <sanitized>
+#     enabled: false
+#     helper_timeout_seconds: 3
+#   # This runs ONCE per process at startup.
+mcp_servers:
+  alpha:
+    command: /opt/fixture/bin/alpha
+    args:
+      - mcp
+  rex:
+    command: npx
+    args:
+      - -y
+      - fixture-agents@6.4.0
+      - mcp
+    env:
+      LAUNCHER_PATH: /Users/fixture/Applications/Tool.app/Contents/MacOS/tool
+  remote:
+    url: https://example.invalid/mcp
+  memory-srv:
+    command: /usr/bin/python3
+    args:
+      - /Users/fixture/proj/mem/mcp_server.py
+  node_repl:
+    command: /Applications/Fixture.app/Contents/Resources/node_repl
+    env:
+      NODE_REPL_FLAG: '1'
+      NODE_REPL_JSON: '{"browser":"/Users/fixture/x"}'
+  computer:
+    command: /opt/fixture/bin/computer
+    args:
+      - mcp
+    cwd: .
+  disabled_one:
+    url: https://example.invalid/sse
+    auth: oauth
+    enabled: false
+web:
+  backend: fixture
+zz_other:
+  fake_child:
+    x: 1
+  second_child:
+    y: 2
+fallback_providers:
+  - provider: fixture
+    model: fixture/model:free

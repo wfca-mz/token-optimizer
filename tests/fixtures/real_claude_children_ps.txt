@@ -1,0 +1,12 @@
+# Sanitized `ps -axo pid=,ppid=,args=` rows: children of one live interactive claude (pid 100),
+# captured read-only from a real session; paths and package names replaced, shapes kept.
+23288 100 /bin/zsh -c source /Users/fixture/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true && eval 'du -sh /tmp' < /dev/null && pwd -P >| /tmp/claude-cwd
+5781 100 npm exec @playwright/mcp@latest
+5784 100 npm exec chrome-devtools-mcp@1.11.0
+5787 100 /opt/homebrew/bin/uv tool uvx awslabs.aws-serverless-mcp-server@latest --allow-write
+23886 100 docker run -i --rm -e TFE_TOKEN=${TFE_TOKEN} hashicorp/terraform-mcp-server:0.4.0
+6007 100 /opt/homebrew/Cellar/python@3.14/3.14.4_1/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/fixture/proj/mem/scripts/../mcp_server.py
+6019 100 /opt/srvx/.venv/bin/python3 /opt/srvx/.venv/bin/srvx mcp
+6023 100 npm exec fixture-agents@6.4.0 mcp
+62259 100 caffeinate -i -t 300
+76457 100 /opt/homebrew/Cellar/python@3.11/3.11.15_3/Frameworks/Python.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python /opt/homebrew/bin/pyright-langserver --stdio

@@ -1,0 +1,12 @@
+{
+  "_note": "Sanitized command/args of the MCP servers behind the real child processes in real_claude_children_ps.txt (user ~/.claude.json and enabled plugin .mcp.json / plugin.json shapes).",
+  "servers": {
+    "playwright": {"command": "npx", "args": ["@playwright/mcp@latest"]},
+    "chrome-devtools": {"command": "npx", "args": ["chrome-devtools-mcp@1.11.0"]},
+    "aws-serverless": {"command": "uvx", "args": ["awslabs.aws-serverless-mcp-server@latest", "--allow-write"]},
+    "terraform": {"command": "docker", "args": ["run", "-i", "--rm", "-e", "TFE_TOKEN=${TFE_TOKEN}", "hashicorp/terraform-mcp-server:0.4.0"]},
+    "srvx": {"type": "stdio", "command": "/opt/srvx/.venv/bin/srvx", "args": ["mcp"]},
+    "rex": {"command": "npx", "args": ["-y", "fixture-agents@6.4.0", "mcp"]},
+    "memory": {"type": "stdio", "command": "sh", "args": ["-c", "for d in \"${CLAUDE_PLUGIN_ROOT:-}\" \"$HOME/proj/mem\"; do [ -x \"$d/scripts/run_mcp.sh\" ] && exec \"$d/scripts/run_mcp.sh\"; done; exit 1"]}
+  }
+}
