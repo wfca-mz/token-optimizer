@@ -790,11 +790,13 @@ def test_installer_prefers_newest_acceptable_python(tmp_path):
     assert r.returncode == 0 and r.stdout.strip() == str(tmp_path / "bin/python3.13")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_installer_skips_too_old_python_and_falls_through(tmp_path):
     r = resolve(tmp_path, {"python3.13": False, "python3.11": True, "python3": False})
     assert r.stdout.strip() == str(tmp_path / "bin/python3.11")
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_installer_refuses_when_no_python_311(tmp_path):
     r = resolve(tmp_path, {"python3.13": False, "python3": False})
     assert r.returncode != 0 and "3.11" in r.stderr

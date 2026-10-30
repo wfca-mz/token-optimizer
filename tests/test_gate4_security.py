@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import sys
 import pytest
 
 from test_tokopt import proc  # noqa: F401
@@ -60,6 +61,7 @@ def make_exe(tmp_path: Path) -> Path:
     return f
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_pinned_exe_prints_the_resolved_real_path(tmp_path):
     real = make_exe(tmp_path)
     link = tmp_path / "ln"

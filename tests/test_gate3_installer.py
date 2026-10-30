@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +30,7 @@ def exe(tmp_path) -> Path:
     return f
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_validate_exe_accepts_a_private_absolute_executable(tmp_path, exe):
     r = sh(tmp_path, f'validate_exe "{exe}"')
     assert r.returncode == 0, r.stderr

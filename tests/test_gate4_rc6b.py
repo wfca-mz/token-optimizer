@@ -155,6 +155,7 @@ def installer_env(tmp_path: Path):
     return stub, repo
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_tokopt_on_path_wins_over_tokopt_python(tmp_path):
     stub, repo = installer_env(tmp_path)
     exe = tmp_path / "bin/tokopt"
@@ -174,6 +175,7 @@ def test_tokopt_on_path_wins_over_tokopt_python(tmp_path):
     assert r.returncode == 0 and str(exe.resolve()) in plist and str(other) not in plist and "<string>-I</string>" not in plist
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_symlinked_venv_python_resolves_to_the_base_interpreter(tmp_path):
     base = tmp_path / "base/python3"
     base.parent.mkdir()

@@ -7,6 +7,7 @@ import stat
 import subprocess
 from pathlib import Path
 
+import sys
 import pytest
 
 from test_tokopt import fake_home, proc, write_log, iso, run, kill_env, sess, NOW, POLICY  # noqa: F401
@@ -44,6 +45,7 @@ def test_symlink_in_a_world_writable_dir_is_refused_even_though_the_target_is_va
     assert r.returncode != 0 and "writable" in r.stderr
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_an_intermediate_hop_in_an_unsafe_dir_is_refused(tmp_path):
     tmp_path.chmod(0o755)
     real = exe_in(tmp_path / "good")
@@ -117,6 +119,7 @@ def pip_wrapper(path: Path, interp: str) -> Path:
     return path
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_pip_exec_wrapper_interpreter_is_validated(tmp_path):
     tmp_path.chmod(0o755)
     py = exe_in(tmp_path / "py", "python3")
@@ -174,6 +177,7 @@ def run_installer(tmp_path: Path, extra_env: dict, path_dirs: list[Path]) -> sub
     return subprocess.run(["/bin/bash", str(INSTALLER)], capture_output=True, text=True, env=env)
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_installer_writes_the_resolved_validated_program_into_the_plist(tmp_path):
     real = exe_in(tmp_path / "pipx/venv/bin", "tokopt")
     link_dir = tmp_path / "local/bin"
@@ -197,6 +201,7 @@ def test_installer_refuses_and_writes_no_plist_for_a_link_in_a_world_writable_di
     assert not (tmp_path / "Library/LaunchAgents/com.tokopt.agent.plist").exists()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_python_route_smoke_test_runs_isolated_with_tokopt_python(tmp_path):
     log = tmp_path / "args.txt"
     py = exe_in(tmp_path / "pybin", "python3", f'#!/bin/sh\necho "$@" > "{log}"\nexit 0\n')

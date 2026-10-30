@@ -133,6 +133,7 @@ def test_ledger_failures_in_reconcile_and_nothing_to_restore_do_not_traceback(fa
 
 # ---------- --status fallback branch (no `tokopt` on PATH) ----------
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_status_falls_back_to_python_when_tokopt_is_not_on_path(tmp_path):
     p = tmp_path / "Library/LaunchAgents/com.tokopt.agent.plist"
     p.parent.mkdir(parents=True)

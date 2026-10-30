@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +32,7 @@ def tree(tmp_path: Path, mode: int) -> Path:
     return exe
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_stock_homebrew_layout_775_admin_owned_by_me_is_accepted(tmp_path):
     exe = tree(tmp_path, 0o775)
     r = sh(tmp_path, f'{ADMIN}; validate_exe "{exe}"')
@@ -76,6 +78,7 @@ def script(path: Path, shebang: str) -> Path:
     return path
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="the launchd installer is macOS-only (Linux /tmp is world-writable, which it refuses by design)")
 def test_shebang_interpreter_is_validated_like_the_program(tmp_path):
     py = tree(tmp_path, 0o755)
     ok = script(tmp_path / "tokopt", f"#!{py}")
