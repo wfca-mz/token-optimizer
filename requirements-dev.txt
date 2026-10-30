@@ -1,2 +1,2 @@
 pytest==9.0.3
-pyright==1.1.408
+pyright==1.1.414
