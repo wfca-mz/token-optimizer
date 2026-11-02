@@ -49,6 +49,10 @@ dir_owner() {
   ls -ld "$1" | awk '{print $3}'
 }
 
+current_uid() {
+  id -u
+}
+
 current_user() {
   id -un
 }
@@ -125,7 +129,7 @@ resolve_exe() {
 # Succeed only if $1 is owned by the current user or root (nobody else may have created or replaced it).
 check_owner() {
   local p="$1" uid
-  uid="$(id -u)"
+  uid="$(current_uid)"
   if [ -n "$(find "$p" -maxdepth 0 \( -user "$uid" -o -user 0 \) 2>/dev/null)" ]; then
     return 0
   fi

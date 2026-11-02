@@ -44,14 +44,15 @@ def nudges(path: Path | None = None) -> list[str]:
 
 REAL_CONSOLE_SCRIPT = wiz._console_script  # the autouse fixture replaces these; tests that need the real ones re-set them
 REAL_RUN_INSTALLER = wiz._run_installer
+darwin_only = pytest.mark.skipif(sys.platform != "darwin", reason="tmp dirs on Linux sit under a world-writable /tmp, which the trust chain refuses by design (same as the installer tests)")
 
 
 @pytest.fixture(autouse=True)
 def stubs(monkeypatch):
-    calls = {"installer": 0, "launchctl": []}
+    calls = {"installer": 0, "installer_args": []}
     monkeypatch.setattr(wiz, "_console_script", lambda name: f"/opt/venv/bin/{name}")
-    monkeypatch.setattr(wiz, "_run_installer", lambda: calls.__setitem__("installer", calls["installer"] + 1) or 0)
-    monkeypatch.setattr(wiz, "_launchctl", lambda *args: calls["launchctl"].append(args))
+    monkeypatch.setattr(wiz, "_run_installer", lambda *args: calls["installer_args"].append(args) or (
+        calls.__setitem__("installer", calls["installer"] + (not args)) or 0))
     monkeypatch.setattr(wiz, "_is_tty", lambda: False)
     monkeypatch.setattr(sys, "platform", "darwin")
     return calls
@@ -157,6 +158,8 @@ def test_hook_remove_takes_only_our_entry_and_prunes_what_it_emptied():
 
 def test_nudge_command_falls_back_to_python_module_when_no_console_script(monkeypatch):
     monkeypatch.setattr(wiz, "_console_script", lambda name: None)
+    monkeypatch.setattr(wiz, "_safe_exe", lambda p: p)
+    monkeypatch.setattr(wiz, "_can_import_nudge", lambda py: True)
     c = wiz.nudge_command()
     assert c.endswith("-I -m tokopt.nudge") and sys.executable in c  # -I: the hook runs in any cwd, which must not be importable
 
@@ -346,9 +349,10 @@ def test_other_os_prints_the_cron_line_and_never_fails(monkeypatch, stubs, capsy
 
 
 def test_installer_failure_is_reported_and_setup_continues(monkeypatch, capsys):
-    monkeypatch.setattr(wiz, "_run_installer", lambda: 1)
-    assert cli.main(["setup", "--yes"]) == 0  # scheduling is optional: never fail the wizard
-    assert "scheduling failed" in capsys.readouterr().out
+    monkeypatch.setattr(wiz, "_run_installer", lambda *args: 1)
+    assert cli.main(["setup", "--yes"]) == 1  # reported and non-zero, but the remaining steps still run
+    out = capsys.readouterr().out
+    assert "scheduling failed" in out and "[6/6]" in out
 
 
 def test_installer_script_missing_is_explained(monkeypatch, capsys):
@@ -426,7 +430,7 @@ def test_uninstall_removes_hook_and_job_but_keeps_ledger_and_backups(monkeypatch
     (state / "ledger.jsonl").write_text('{"id":"x"}\n')
     assert cli.main(["setup", "--uninstall", "--yes"]) == 0
     assert nudges(p) == [] and json.loads(p.read_text()) == json.loads(FIXTURE.read_text())
-    assert not plist.exists() and stubs["launchctl"] == [("unload", str(plist))]
+    assert stubs["installer_args"] == [(), ("--uninstall",)]  # the installer removes its own job
     assert (state / "ledger.jsonl").exists() and any((state / "backups").rglob("*settings.json"))
 
 
@@ -495,13 +499,14 @@ def test_a_relative_or_empty_path_entry_never_becomes_the_hook_command(monkeypat
         assert str(cwd) not in cmd, cmd
 
 
+@darwin_only
 def test_a_console_script_in_a_group_or_world_writable_dir_is_refused(monkeypatch, tmp_path):
     real_resolution(monkeypatch)
     d = tmp_path / "bin"
     exe = plant(d, "tokopt-nudge")
     monkeypatch.setenv("PATH", str(d))
     d.chmod(0o755)
-    assert wiz._console_script("tokopt-nudge") == str(exe)
+    assert wiz._console_script("tokopt-nudge") == os.path.realpath(exe)
     d.chmod(0o775)
     assert wiz._console_script("tokopt-nudge") is None
     d.chmod(0o757)
@@ -577,9 +582,213 @@ def test_apply_success_leaves_exit_code_zero(monkeypatch):
 
 def test_docs_cover_the_audit_notes():
     sec = (ROOT / "SECURITY.md").read_text()
-    for needle in ("absolute path", "symlink", "cannot park"):
+    for needle in ("pinned_exe", "symlink", "cannot park or stop", "never passes `--yes`", "tokopt/install-tokopt-launchd.sh"):
         assert needle in sec, needle
     assert "symlink" in (ROOT / "README.md").read_text().lower()
+
+
+# ---------- trust chain of the hook program (re-audit F2): one implementation, the installer's ----------
+
+INSTALLER_SH = ROOT / "tokopt/install-tokopt-launchd.sh"
+
+
+def script(path: Path, body: str = "#!/bin/sh\nexit 0\n", mode: int = 0o755) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    path.chmod(mode)
+    return path
+
+
+def only_path(monkeypatch, *dirs: Path):
+    monkeypatch.setattr(wiz, "_console_script", REAL_CONSOLE_SCRIPT)
+    monkeypatch.setenv("PATH", os.pathsep.join(str(d) for d in dirs))
+
+
+@darwin_only
+def test_a_console_script_in_a_clean_chain_is_accepted_and_the_resolved_real_path_is_written(monkeypatch, tmp_path):
+    real = script(tmp_path / "venv/bin/tokopt-nudge")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/tokopt-nudge").symlink_to(real)  # the usual pipx layout: ~/.local/bin/x -> venv/bin/x
+    only_path(monkeypatch, tmp_path / "bin")
+    assert wiz.nudge_command() == shlex.quote(os.path.realpath(real))  # the file that was checked is the file that runs
+
+
+@darwin_only
+def test_a_symlink_into_a_world_writable_directory_is_refused(monkeypatch, tmp_path):  # (a)
+    danger = tmp_path / "danger"
+    real = script(danger / "real-nudge")
+    danger.chmod(0o777)
+    (tmp_path / "safe").mkdir()
+    (tmp_path / "safe/tokopt-nudge").symlink_to(real)
+    only_path(monkeypatch, tmp_path / "safe")
+    assert wiz._console_script("tokopt-nudge") is None
+
+
+@darwin_only
+def test_a_writable_ancestor_above_a_clean_bin_dir_is_refused(monkeypatch, tmp_path):  # (b)
+    script(tmp_path / "open/bin/tokopt-nudge")
+    (tmp_path / "open").chmod(0o777)
+    only_path(monkeypatch, tmp_path / "open/bin")
+    assert wiz._console_script("tokopt-nudge") is None
+
+
+@darwin_only
+@pytest.mark.parametrize("shebang", [
+    "#!{bad}/python\n",                                  # interpreter in a world-writable directory
+    "#!/usr/bin/env python3\n",                         # found through PATH at run time
+    "#!/bin/sh\n'''exec' \"{bad}/python\" \"$0\" \"$@\"\n",  # the pip console-script form
+    "#!/bin/sh\n'''exec' python3 \"$0\"\n",             # re-exec we cannot parse
+])
+def test_the_shebang_interpreter_gets_the_same_chain_check(monkeypatch, tmp_path, shebang):  # (c)
+    bad = tmp_path / "bad"
+    script(bad / "python")
+    bad.chmod(0o777)
+    script(tmp_path / "bin/tokopt-nudge", shebang.format(bad=bad) + "echo hi\n")
+    only_path(monkeypatch, tmp_path / "bin")
+    assert wiz._console_script("tokopt-nudge") is None
+
+
+@darwin_only
+def test_a_clean_pip_style_script_with_a_clean_interpreter_is_accepted(monkeypatch, tmp_path):
+    py = script(tmp_path / "py/bin/python")
+    script(tmp_path / "bin/tokopt-nudge", f"#!/bin/sh\n'''exec' \"{py}\" \"$0\" \"$@\"\n' '''\n")
+    only_path(monkeypatch, tmp_path / "bin")
+    assert wiz._console_script("tokopt-nudge") == os.path.realpath(tmp_path / "bin/tokopt-nudge")
+
+
+@darwin_only
+def test_a_file_owned_by_another_uid_is_refused(tmp_path):  # (d): the installer's ownership check, with the uid seam
+    exe = script(tmp_path / "bin/tokopt-nudge")
+    ok = f'source "{INSTALLER_SH}"; pinned_exe "{exe}"'
+    run = lambda body: subprocess.run(["/bin/bash", "-c", body], capture_output=True, text=True)  # noqa: E731
+    assert run(ok).returncode == 0
+    r = run(f'source "{INSTALLER_SH}"; current_uid() {{ echo 4242; }}; pinned_exe "{exe}"')
+    assert r.returncode != 0 and "not owned by you" in r.stderr
+
+
+@darwin_only
+def test_setup_uses_the_installers_check_not_a_copy_of_it(monkeypatch, tmp_path):
+    exe = script(tmp_path / "bin/tokopt-nudge")
+    seen = []
+    real_run = subprocess.run
+    monkeypatch.setattr(subprocess, "run", lambda cmd, *a, **k: seen.append(cmd) or real_run(cmd, *a, **k))
+    assert wiz._safe_exe(str(exe)) == os.path.realpath(exe)
+    assert any("pinned_exe" in " ".join(map(str, c)) for c in seen)  # the installer's function, sourced
+    assert wiz._safe_exe("relative/tokopt-nudge") is None and wiz._safe_exe(str(tmp_path / "missing")) is None
+
+
+@darwin_only
+def test_interpreter_fallback_is_chain_checked_on_its_real_path(monkeypatch, tmp_path):
+    real = script(tmp_path / "realpy/bin/python")
+    (tmp_path / "link").mkdir()
+    (tmp_path / "link/python").symlink_to(real)
+    monkeypatch.setattr(wiz, "_console_script", lambda name: None)
+    monkeypatch.setattr(wiz, "_can_import_nudge", lambda py: True)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "link/python"))
+    assert wiz.nudge_command() == f"{shlex.quote(os.path.realpath(real))} -I -m tokopt.nudge"
+    (tmp_path / "realpy").chmod(0o777)
+    assert wiz.nudge_command() is None
+
+
+# ---------- which hooks count as tokopt's (re-audit F3) ----------
+
+@pytest.mark.parametrize("cmd", [
+    "tokopt-nudge",                       # bare: resolved through PATH at run time, we cannot say it is gone
+    "python -m tokopt.nudge",
+    "python3 -I -m tokopt.nudge",
+    "my-wrapper.sh -m tokopt.nudge",      # not a python interpreter
+    "/no such/tokopt-nudge",              # unquoted: two words, argv[0] is /no
+])
+def test_hooks_that_are_not_provably_tokopts_are_never_stale(cmd):
+    base = wiz.hook_add(FIXTURE.read_text(), cmd)
+    assert wiz.stale_hooks(base, NUDGE) == []
+    assert cmd in nudges_in(wiz.hook_add(base, NUDGE, replace_stale=True))  # kept, ours added next to it
+    assert cmd in nudges_in(wiz.hook_remove(wiz.hook_add(base, NUDGE), NUDGE))  # and uninstall leaves it
+
+
+def test_an_existing_tokopt_nudge_by_absolute_path_is_the_users(tmp_path):
+    own = script(tmp_path / "tokopt-nudge")
+    base = wiz.hook_add(FIXTURE.read_text(), str(own))
+    assert wiz.stale_hooks(base, NUDGE) == []
+
+
+@pytest.mark.parametrize("cmd", ["'/no such/tokopt-nudge'", "/gone/bin/tokopt-nudge", "/gone/python -I -m tokopt.nudge",
+                                 "/gone/python3.12 -m tokopt.nudge"])
+def test_a_missing_absolute_tokopt_program_is_stale_and_replaced_in_place(cmd):
+    base = wiz.hook_add(FIXTURE.read_text(), cmd)
+    assert wiz.stale_hooks(base, NUDGE) == [cmd]
+    assert nudges_in(wiz.hook_add(base, NUDGE, replace_stale=True)) == [NUDGE]
+
+
+def test_a_prior_interpreter_fallback_hook_is_replaced_by_the_console_script_without_a_duplicate(tmp_path):
+    py = script(tmp_path / "bin/python")  # exists: not "missing", but the fallback form is tokopt's own
+    old = f"{py} -I -m tokopt.nudge"
+    base = wiz.hook_add(FIXTURE.read_text(), old)
+    assert wiz.stale_hooks(base, NUDGE) == [old]
+    assert nudges_in(wiz.hook_add(base, NUDGE, replace_stale=True)) == [NUDGE]
+    assert wiz.hook_remove(base, NUDGE) == FIXTURE.read_text()
+
+
+@darwin_only
+def test_a_fallback_interpreter_that_cannot_import_tokopt_is_refused(monkeypatch, tmp_path, capsys):
+    bad_py = script(tmp_path / "py/bin/python", "#!/bin/sh\nexit 1\n")
+    monkeypatch.setattr(wiz, "_console_script", lambda name: None)
+    monkeypatch.setattr(wiz, "_safe_exe", lambda p: str(bad_py))
+    assert wiz.nudge_command() is None
+    assert "cannot import tokopt" in " ".join(wiz.REFUSALS)
+    good_py = script(tmp_path / "py2/bin/python", "#!/bin/sh\nexit 0\n")
+    monkeypatch.setattr(wiz, "_safe_exe", lambda p: str(good_py))
+    assert wiz.nudge_command() == f"{good_py} -I -m tokopt.nudge"
+    put_settings()
+    monkeypatch.setattr(wiz, "_safe_exe", lambda p: str(bad_py))
+    original = settings().read_bytes()
+    assert cli.main(["setup", "--yes"]) == 1 and settings().read_bytes() == original
+    assert "cannot import tokopt" in capsys.readouterr().out
+
+
+def test_user_written_hook_forms_survive_install_and_uninstall_untouched():
+    cmds = ["tokopt-nudge", "python3 -m tokopt.nudge", "~/.local/bin/tokopt-nudge", "$HOME/.local/bin/tokopt-nudge",
+            "FOO=1 /usr/bin/python3 -m tokopt.nudge", "uv run -m tokopt.nudge"]
+    text = FIXTURE.read_text()
+    for c in cmds:
+        text = wiz.hook_add(text, c)
+    assert wiz.stale_hooks(text, NUDGE) == []
+    installed = wiz.hook_add(text, NUDGE, replace_stale=True)
+    assert nudges_in(installed) == [*cmds, NUDGE]
+    assert nudges_in(wiz.hook_remove(installed, NUDGE)) == cmds
+
+
+def test_a_failed_launchd_install_exits_non_zero_even_when_everything_else_worked(monkeypatch):
+    monkeypatch.setattr(wiz, "_run_installer", lambda *args: 3)
+    assert cli.main(["setup", "--yes"]) == 1
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize("entry,env_root", [("scripts/install-tokopt-launchd.sh", True), ("tokopt/install-tokopt-launchd.sh", False)])
+def test_installer_refuses_a_worktree_through_the_wrapper_and_by_default_repo_root(tmp_path, entry, env_root):
+    """The wrapper forwards TOKOPT_REPO_ROOT; run directly, repo_root defaults to the script's own directory."""
+    tree = tmp_path / ".claude/worktrees/x"
+    shutil.copytree(ROOT / "scripts", tree / "scripts")
+    shutil.copytree(ROOT / "tokopt", tree / "tokopt", ignore=shutil.ignore_patterns("__pycache__"))
+    r = subprocess.run(["/bin/bash", str(tree / entry)], capture_output=True, text=True, cwd=tmp_path,
+                       env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+    assert r.returncode == 1 and "worktree" in r.stderr, (r.returncode, r.stderr)
+    assert "scripts/../" not in r.stderr  # usage/diagnostics show a normalised path
+
+
+def test_the_current_fallback_command_is_ours_not_stale(tmp_path):
+    py = script(tmp_path / "bin/python")
+    cmd = f"{py} -I -m tokopt.nudge"
+    base = wiz.hook_add(FIXTURE.read_text(), cmd)
+    assert wiz.stale_hooks(base, cmd) == []
+    with pytest.raises(cli.NoChange):
+        wiz.hook_add(base, cmd)
+
+
+def test_the_canonical_json_refusal_is_what_the_docs_say():
+    with pytest.raises(ValueError, match="canonical 2-space JSON"):
+        wiz.hook_add('{"theme":"x"}', NUDGE)
+    assert "2-space" in (ROOT / "README.md").read_text() and "2-space" in (ROOT / "SECURITY.md").read_text()
 
 
 def test_the_fixture_is_canonical_two_space_json():
