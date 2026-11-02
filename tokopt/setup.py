@@ -268,7 +268,7 @@ def _recorded() -> list[str]:
     except (OSError, ValueError, RecursionError):
         return []
     c = d.get("commands") if isinstance(d, dict) else None
-    return [x for x in c[:RECORD_MAX] if _valid_record(x)] if isinstance(c, list) else []
+    return [x for x in c[-RECORD_MAX:] if _valid_record(x)] if isinstance(c, list) else []
 
 
 def _record(cmd: str) -> None:
@@ -276,7 +276,7 @@ def _record(cmd: str) -> None:
     if cmd not in cmds:
         cmds.append(cmd)
     cli.private_dir(cli.state_dir())
-    atomic_write(_record_path(), json.dumps({"commands": cmds}).encode(), 0o600, follow=False)
+    atomic_write(_record_path(), json.dumps({"commands": cmds[-RECORD_MAX:]}).encode(), 0o600, follow=False)  # newest kept
 
 
 def _forget() -> None:
@@ -383,6 +383,8 @@ def _run_installer(*args: str) -> int:
     if not p.is_file():
         say(f"The launchd installer is missing from this installation ({p}); reinstall tokopt.")
         return 1
+    sys.stdout.flush()  # our own output first, or piped output interleaves out of order with the installer's
+    sys.stderr.flush()
     return subprocess.run(["/bin/bash", str(p), *args], check=False, env=_clean_env()).returncode
 
 

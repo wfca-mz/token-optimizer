@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import REAL_HOME, snapshot
+from conftest import CREATED_TEMP_DIRS, REAL_HOME, snapshot
 from tokopt import cli, setup as wiz
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +56,7 @@ def safe_tmp():
         d = Path(tempfile.mkdtemp(prefix="tokopt-test-", dir=REAL_HOME))
     except OSError as e:
         pytest.skip(f"cannot create a private temp dir under the home directory: {e}")
+    CREATED_TEMP_DIRS.add(str(d))
     try:
         probe = d / "probe/tokopt-nudge"
         probe.parent.mkdir()
@@ -1035,6 +1036,44 @@ def test_the_installer_environment_has_no_python_variables(monkeypatch, tmp_path
     env = wiz._clean_env()
     assert not [k for k in env if k.startswith("PYTHON")]
     assert subprocess.run(probe, capture_output=True, text=True, env=env).stdout.strip() == "False"
+
+
+def test_the_record_keeps_the_newest_entries_when_it_is_full():
+    n = wiz.RECORD_MAX
+    for i in range(n + 5):
+        wiz._record(f"/v{i}/tokopt-nudge")
+    on_disk = json.loads((h() / ".local/state/tokopt/setup-hook.json").read_text())["commands"]
+    assert len(on_disk) == n and on_disk[-1] == f"/v{n + 4}/tokopt-nudge"  # never grows past the cap
+    assert wiz._recorded()[-1] == f"/v{n + 4}/tokopt-nudge"  # the one just installed is not the one dropped
+    assert "/v0/tokopt-nudge" not in wiz._recorded()  # the oldest is
+
+
+def test_output_is_flushed_before_the_installer_subprocess_runs(monkeypatch):
+    flushed = []
+
+    class Out:
+        def write(self, s): return len(s)
+        def flush(self): flushed.append(1)
+
+    monkeypatch.setattr(sys, "stdout", Out())
+    monkeypatch.setattr(sys, "stderr", Out())
+    seen = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: seen.append(len(flushed)) or subprocess.CompletedProcess(cmd, 0))
+    monkeypatch.setattr(wiz, "_run_installer", REAL_RUN_INSTALLER)
+    assert wiz._run_installer("--status") == 0
+    assert seen and seen[0] >= 2  # stdout and stderr were both flushed first, so piped output keeps its order
+
+
+def test_the_leftover_check_only_looks_at_directories_this_run_created(tmp_path):
+    import conftest
+    mine = tmp_path / "tokopt-test-mine"
+    mine.mkdir()
+    assert conftest.leftover_temp_dirs() == []
+    conftest.CREATED_TEMP_DIRS.add(str(mine))
+    try:
+        assert conftest.leftover_temp_dirs() == [str(mine)]
+    finally:
+        conftest.CREATED_TEMP_DIRS.discard(str(mine))
 
 
 def test_the_fixture_is_canonical_two_space_json():

@@ -49,8 +49,15 @@ def _private_home(tmp_path_factory, monkeypatch):
         monkeypatch.delenv(var)
 
 
+CREATED_TEMP_DIRS: set[str] = set()  # directories the safe_tmp fixture made in THIS run (other pytest runs are not ours)
+
+
+def leftover_temp_dirs() -> list[str]:
+    return sorted(d for d in CREATED_TEMP_DIRS if os.path.lexists(d))
+
+
 def pytest_sessionfinish(session, exitstatus):
-    left = sorted(str(p) for p in REAL_HOME.glob("tokopt-test-*"))  # the safe_tmp fixture's directories
+    left = leftover_temp_dirs()
     if left:
         print("\nTESTS LEFT TEMP DIRECTORIES IN THE REAL HOME (remove them):\n  " + "\n  ".join(left))
         session.exitstatus = 1
