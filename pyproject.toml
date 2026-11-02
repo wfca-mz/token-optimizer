@@ -19,6 +19,9 @@ tokopt-nudge = "tokopt.nudge:main"
 [tool.setuptools]
 packages = ["tokopt"]
 
+[tool.setuptools.package-data]
+tokopt = ["install-tokopt-launchd.sh"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

@@ -1468,7 +1468,7 @@ def scheduled_job_warning() -> str:
             prog = plistlib.load(f)["ProgramArguments"][0]
         if isinstance(prog, str) and not os.access(prog, os.X_OK):
             return (f"WARNING scheduled job: its program {prog} no longer exists or is not executable (Python or pipx "
-                    "was upgraded or reinstalled): re-run scripts/install-tokopt-launchd.sh")
+                    "was upgraded or reinstalled): re-run `tokopt setup` (checkout: scripts/install-tokopt-launchd.sh)")
     except Exception:  # OSError, ExpatError, RecursionError, KeyError, ValueError (NUL byte), ...: no usable job
         pass
     return ""

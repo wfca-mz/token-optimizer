@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
+import subprocess
+import tomllib
 import stat
 import sys
 from pathlib import Path
@@ -38,6 +42,10 @@ def nudges(path: Path | None = None) -> list[str]:
     return [x["command"] for e in d["hooks"]["UserPromptSubmit"] for x in e["hooks"] if "tokopt-nudge" in x["command"]]
 
 
+REAL_CONSOLE_SCRIPT = wiz._console_script  # the autouse fixture replaces these; tests that need the real ones re-set them
+REAL_RUN_INSTALLER = wiz._run_installer
+
+
 @pytest.fixture(autouse=True)
 def stubs(monkeypatch):
     calls = {"installer": 0, "launchctl": []}
@@ -68,12 +76,57 @@ def test_hook_add_appends_once_and_keeps_everything_else():
     assert out.endswith("\n")
 
 
-def test_hook_add_is_idempotent_even_when_an_older_path_is_registered():
-    out = wiz.hook_add(FIXTURE.read_text(), "/old/place/tokopt-nudge")
+def test_hook_add_is_idempotent_for_our_command():
+    out = wiz.hook_add(FIXTURE.read_text(), NUDGE)
     with pytest.raises(cli.NoChange):
-        wiz.hook_add(out, NUDGE)  # different path, same hook: no duplicate
+        wiz.hook_add(out, NUDGE)
+
+
+def nudges_in(text: str) -> list[str]:
+    d = json.loads(text)
+    return [x["command"] for e in d["hooks"]["UserPromptSubmit"] for x in e["hooks"] if "nudge" in x["command"]]
+
+
+def test_a_users_own_tokopt_nudge_elsewhere_is_not_ours_and_survives_add_and_remove(tmp_path):
+    own = tmp_path / "tokopt-nudge"  # exists: not stale, so it is the user's to keep
+    own.write_text("#!/bin/sh\n")
+    mine = str(own)
+    base = wiz.hook_add(FIXTURE.read_text(), mine)
+    both = wiz.hook_add(base, NUDGE)  # not a duplicate of ours: added next to it
+    assert len(nudges_in(both)) == 2
+    assert nudges_in(wiz.hook_remove(both, NUDGE)) == [mine]
     with pytest.raises(cli.NoChange):
-        wiz.hook_add(wiz.hook_add("{}\n", "/py -m tokopt.nudge"), NUDGE)
+        wiz.hook_remove(base, NUDGE)  # only the user's hook present: uninstall must not touch it
+
+
+def test_a_stale_tokopt_hook_is_found_replaced_in_place_and_removed_but_nothing_else_is(tmp_path):
+    gone = "/gone/venv/bin/tokopt-nudge"
+    gone_py = "/gone/venv/bin/python -I -m tokopt.nudge"
+    base = wiz.hook_add(wiz.hook_add(FIXTURE.read_text(), gone), gone_py)
+    assert wiz.stale_hooks(base, NUDGE) == [gone, gone_py]
+    assert wiz.stale_hooks(FIXTURE.read_text(), NUDGE) == []  # /path/to/hooks/*.sh are not tokopt hooks
+    swapped = wiz.hook_add(base, NUDGE, replace_stale=True)
+    assert nudges_in(swapped) == [NUDGE]  # first stale rewritten in place, the other stale one dropped: one hook left
+    both = wiz.hook_add(base, NUDGE)  # without replace_stale: appended, stale ones untouched
+    assert nudges_in(both) == [gone, gone_py, NUDGE]
+    assert wiz.hook_remove(both, NUDGE) == FIXTURE.read_text()  # ours AND the stale ones go; the user's hooks stay
+
+
+def test_hook_remove_keeps_other_hooks_that_share_an_entry_with_ours():
+    d = json.loads(wiz.hook_add(FIXTURE.read_text(), NUDGE))
+    entry = d["hooks"]["UserPromptSubmit"][-1]
+    entry["hooks"].insert(0, {"type": "command", "command": "/path/to/hooks/other.sh", "timeout": 3})
+    out = wiz.hook_remove(canon(d), NUDGE)
+    kept = json.loads(out)["hooks"]["UserPromptSubmit"][-1]["hooks"]
+    assert [x["command"] for x in kept] == ["/path/to/hooks/other.sh"]
+
+
+def test_setup_reports_and_replaces_a_stale_hook_path(capsys):
+    put_settings(wiz.hook_add(FIXTURE.read_text(), "/gone/venv/bin/tokopt-nudge"))
+    cli.main(["setup", "--yes"])
+    out = capsys.readouterr().out
+    assert "no longer exists" in out and "replaced" in out and "already installed" not in out
+    assert nudges() == [NUDGE]
 
 
 def test_hook_add_creates_the_hooks_structure_when_absent():
@@ -95,17 +148,17 @@ def test_hook_add_refuses_what_it_cannot_edit_safely(bad):
 
 def test_hook_remove_takes_only_our_entry_and_prunes_what_it_emptied():
     out = wiz.hook_add(FIXTURE.read_text(), NUDGE)
-    assert wiz.hook_remove(out) == FIXTURE.read_text()
+    assert wiz.hook_remove(out, NUDGE) == FIXTURE.read_text()
     only = wiz.hook_add("{}\n", NUDGE)
-    assert json.loads(wiz.hook_remove(only)) == {}
+    assert json.loads(wiz.hook_remove(only, NUDGE)) == {}
     with pytest.raises(cli.NoChange):
-        wiz.hook_remove(FIXTURE.read_text())
+        wiz.hook_remove(FIXTURE.read_text(), NUDGE)
 
 
 def test_nudge_command_falls_back_to_python_module_when_no_console_script(monkeypatch):
     monkeypatch.setattr(wiz, "_console_script", lambda name: None)
     c = wiz.nudge_command()
-    assert c.endswith("-m tokopt.nudge") and sys.executable in c
+    assert c.endswith("-I -m tokopt.nudge") and sys.executable in c  # -I: the hook runs in any cwd, which must not be importable
 
 
 # ---------- guard rails ----------
@@ -234,7 +287,7 @@ def test_invalid_settings_json_is_left_untouched(capsys):
 def test_hook_that_would_write_invalid_json_aborts_before_writing(monkeypatch):
     p = put_settings()
     original = p.read_bytes()
-    monkeypatch.setattr(wiz, "hook_add", lambda text, cmd: "{oops")
+    monkeypatch.setattr(wiz, "hook_add", lambda text, cmd, replace_stale=False: "{oops")
     cli.main(["setup", "--yes"])
     assert p.read_bytes() == original
 
@@ -299,10 +352,30 @@ def test_installer_failure_is_reported_and_setup_continues(monkeypatch, capsys):
 
 
 def test_installer_script_missing_is_explained(monkeypatch, capsys):
-    monkeypatch.undo()
+    monkeypatch.setattr(wiz, "_run_installer", REAL_RUN_INSTALLER)
     monkeypatch.setattr(wiz, "_installer_path", lambda: Path("/nonexistent/install.sh"))
     assert wiz._run_installer() != 0
-    assert "checkout" in capsys.readouterr().out
+    assert "reinstall" in capsys.readouterr().out
+
+
+def test_installer_resolves_from_an_installed_layout_not_the_repo(tmp_path):
+    """Copy only what a wheel installs (the package dir) to a fake site-packages and import it from there."""
+    site = tmp_path / "site-packages"
+    shutil.copytree(ROOT / "tokopt", site / "tokopt", ignore=shutil.ignore_patterns("__pycache__"))
+    out = subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]);"
+                          "import tokopt.setup as s; p = s._installer_path(); print(p, p.is_file())", str(site)],
+                         capture_output=True, text=True, cwd=tmp_path)
+    assert out.returncode == 0, out.stderr
+    path, is_file = out.stdout.split()
+    assert path.startswith(str(site)) and is_file == "True" and str(ROOT) not in path
+
+
+def test_the_installer_is_declared_as_package_data_and_scripts_only_forwards_to_it():
+    pkg = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["setuptools"]["package-data"]["tokopt"]
+    assert "install-tokopt-launchd.sh" in pkg and (ROOT / "tokopt/install-tokopt-launchd.sh").is_file()
+    wrapper = (ROOT / "scripts/install-tokopt-launchd.sh").read_text()
+    assert "tokopt/install-tokopt-launchd.sh" in wrapper and len(wrapper.splitlines()) < 10  # no second copy to drift
+    assert f'LABEL="{wiz.LABEL}"' in (ROOT / "tokopt/install-tokopt-launchd.sh").read_text()  # plist name kept in step
 
 
 # ---------- step 6: first apply ----------
@@ -316,12 +389,22 @@ def test_yes_does_not_apply_by_default(capsys):
 def test_accepting_apply_goes_through_the_confirmation_gate(monkeypatch):
     put_settings()
     tty(monkeypatch, ["n", "n", "n", "n", "y"])
-    seen = []
-    real = cli.main
-    monkeypatch.setattr(wiz, "_apply", lambda: seen.append(1) or real(["apply", "--yes"]))
+    argvs, real = [], cli.main
+    monkeypatch.setattr(cli, "main", lambda argv=None: argvs.append(list(argv or [])) or real(argv))
+    monkeypatch.setattr(cli, "_ask", lambda: True)  # the gate's own y/N prompt
+    real(["setup"])
+    assert ["apply"] in argvs and ["apply", "--yes"] not in argvs  # the user must see the plan and answer the gate
+    assert (h() / ".local/state/tokopt/confirmed").exists()
+
+
+def test_interactive_apply_shows_the_plan_and_a_gate_no_writes_nothing(monkeypatch, capsys):
+    put_settings()
+    tty(monkeypatch, ["n", "n", "n", "n", "y"])
+    monkeypatch.setattr(cli, "_ask", lambda: False)
     cli.main(["setup"])
-    assert seen == [1]
-    assert (h() / ".local/state/tokopt/confirmed").exists()  # written by _gate, the same code path as `apply --yes`
+    out = capsys.readouterr().out
+    assert "item" in out and "Nothing changed" in out
+    assert not (h() / ".local/state/tokopt/confirmed").exists()
 
 
 def test_declining_apply_writes_no_confirmation(monkeypatch):
@@ -374,11 +457,6 @@ def test_flags_belong_to_setup_only(capsys):
         cli.main(["apply", "--uninstall"])
 
 
-def test_wizard_never_touches_the_real_home_launchd_or_console(stubs):
-    # the stubs fixture is autouse: if any test reached the real installer/launchctl it would bypass them
-    assert stubs["installer"] == 0 and stubs["launchctl"] == []
-
-
 def test_docs_describe_the_wizard():
     readme = (ROOT / "README.md").read_text()
     for needle in ("## Setup wizard", "## Install on another machine", "tokopt setup", "--dry-run", "--uninstall"):
@@ -386,6 +464,122 @@ def test_docs_describe_the_wizard():
     sec = (ROOT / "SECURITY.md").read_text()
     assert "tokopt setup" in sec and "UserPromptSubmit" in sec
     assert "tokopt setup" in (ROOT / "CHANGELOG.md").read_text()
+
+
+def real_resolution(monkeypatch):
+    monkeypatch.setattr(wiz, "_console_script", REAL_CONSOLE_SCRIPT)  # exercise the real PATH search; HOME stays private
+
+
+def plant(d: Path, name: str) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_text("#!/bin/sh\necho pwned\n")
+    f.chmod(0o755)
+    return f
+
+
+@pytest.mark.parametrize("path_of", [lambda cwd: ".", lambda cwd: ":/usr/bin", lambda cwd: "../" + cwd.name + ":/usr/bin",
+                                     lambda cwd: "bin"])
+def test_a_relative_or_empty_path_entry_never_becomes_the_hook_command(monkeypatch, tmp_path, path_of):
+    real_resolution(monkeypatch)
+    cwd = tmp_path / "repo"
+    plant(cwd, "tokopt-nudge")
+    plant(cwd / "bin", "tokopt-nudge")
+    plant(cwd, "tokopt")
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PATH", path_of(cwd))
+    for cmd in (wiz.nudge_command(), wiz._tokopt_cmd()):
+        if cmd is None:  # nothing safe on this machine (e.g. a group-writable interpreter dir): refusing is correct
+            continue
+        assert os.path.isabs(shlex.split(cmd)[0]), cmd
+        assert str(cwd) not in cmd, cmd
+
+
+def test_a_console_script_in_a_group_or_world_writable_dir_is_refused(monkeypatch, tmp_path):
+    real_resolution(monkeypatch)
+    d = tmp_path / "bin"
+    exe = plant(d, "tokopt-nudge")
+    monkeypatch.setenv("PATH", str(d))
+    d.chmod(0o755)
+    assert wiz._console_script("tokopt-nudge") == str(exe)
+    d.chmod(0o775)
+    assert wiz._console_script("tokopt-nudge") is None
+    d.chmod(0o757)
+    assert wiz._console_script("tokopt-nudge") is None
+
+
+def test_unsafe_interpreter_fallback_aborts_the_hook_step(monkeypatch, capsys):
+    put_settings()
+    monkeypatch.setattr(wiz, "_console_script", lambda name: None)
+    monkeypatch.setattr(wiz, "_safe_exe", lambda p: None)
+    original = settings().read_bytes()
+    assert cli.main(["setup", "--yes"]) == 1
+    assert settings().read_bytes() == original
+    assert "no safe" in capsys.readouterr().out
+
+
+def test_ask_int_survives_unicode_digits_and_absurd_lengths(monkeypatch):
+    for bad in ("²", "٣", "9" * 5000):  # superscript, Arabic-Indic digit, longer than int()'s conversion limit
+        answers = iter([bad, "12"])
+        monkeypatch.setattr("builtins.input", lambda p="": next(answers))
+        assert wiz._ask_int("x", 28, 7) == 12, bad
+
+
+def test_prompts_mask_control_characters_in_paths(monkeypatch):
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p="": prompts.append(p) or "n")
+    wiz._confirm(type("A", (), {"yes": False})(), "Remove \x1b[31m /tmp/x\ny?", True)
+    assert "\x1b" not in prompts[0] and "\n" not in prompts[0]
+
+
+def test_symlinked_settings_json_is_followed_on_install_and_uninstall(tmp_path):
+    real = tmp_path / "dotfiles-settings.json"
+    real.write_text(FIXTURE.read_text())
+    real.chmod(0o640)
+    (h() / ".claude").mkdir()
+    settings().symlink_to(real)
+    assert cli.main(["setup", "--yes"]) == 0
+    assert settings().is_symlink() and nudges(real) == [NUDGE]  # link kept, TARGET replaced atomically
+    assert stat.S_IMODE(real.stat().st_mode) == 0o640
+    bks = list((h() / ".local/state/tokopt/backups").rglob("*settings.json"))
+    assert len(bks) == 1 and bks[0].read_text() == FIXTURE.read_text() and not bks[0].is_symlink()
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0
+    assert settings().is_symlink() and real.read_text() == FIXTURE.read_text()
+
+
+def test_a_symlink_to_something_that_is_not_your_regular_file_is_refused(capsys):
+    (h() / ".claude").mkdir()
+    settings().symlink_to("/dev/null")
+    assert cli.main(["setup", "--yes"]) == 1
+    assert "NOT changed" in capsys.readouterr().out and settings().is_symlink()
+
+
+def test_a_dangling_symlink_is_refused(capsys):
+    (h() / ".claude").mkdir()
+    settings().symlink_to(h() / "nowhere.json")
+    assert cli.main(["setup", "--yes"]) == 1
+    assert not (h() / "nowhere.json").exists()
+
+
+def test_apply_failure_exit_code_reaches_the_wizard_exit_code(monkeypatch):
+    put_settings()
+    tty(monkeypatch, ["n", "n", "n", "n", "y"])
+    monkeypatch.setattr(wiz, "_apply", lambda: 7)
+    assert cli.main(["setup"]) == 7
+
+
+def test_apply_success_leaves_exit_code_zero(monkeypatch):
+    put_settings()
+    tty(monkeypatch, ["n", "n", "n", "n", "y"])
+    monkeypatch.setattr(wiz, "_apply", lambda: 0)
+    assert cli.main(["setup"]) == 0
+
+
+def test_docs_cover_the_audit_notes():
+    sec = (ROOT / "SECURITY.md").read_text()
+    for needle in ("absolute path", "symlink", "cannot park"):
+        assert needle in sec, needle
+    assert "symlink" in (ROOT / "README.md").read_text().lower()
 
 
 def test_the_fixture_is_canonical_two_space_json():

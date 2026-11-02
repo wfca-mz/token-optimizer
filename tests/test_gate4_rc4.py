@@ -13,7 +13,7 @@ from test_tokopt import fake_home, proc, sess, NOW, kill_env, write_log, iso, to
 from tokopt import cli as tokopt
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 REAL_PS_ROWS = tokopt.ps_rows
 POL = {"session_idle_hours": 8, "protect": []}
 

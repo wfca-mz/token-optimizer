@@ -8,7 +8,7 @@ import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 # a stock macOS admin account: group admin, directory owned by me, I am a member of admin
 ADMIN = 'dir_group() { echo admin; }; dir_owner() { echo me; }; current_user() { echo me; }; user_in_group() { [ "$1" = admin ]; }'
 

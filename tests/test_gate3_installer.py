@@ -10,7 +10,7 @@ import sys
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 
 
 def sh(tmp_path, body: str, env: dict | None = None) -> subprocess.CompletedProcess:

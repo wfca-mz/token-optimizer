@@ -11,7 +11,7 @@ from test_tokopt import proc  # noqa: F401
 from tokopt import cli as tokopt
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 
 
 # ---------- F1: caffeinate is idle only in the exact shape Claude spawns ----------

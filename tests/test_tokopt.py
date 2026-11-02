@@ -771,7 +771,7 @@ def test_tasker_is_not_a_cheap_agent_anywhere():
 
 # ---------- installer (N4): only the resolver function runs, under stock bash ----------
 
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 
 
 def resolve(tmp_path, versions: dict) -> subprocess.CompletedProcess:

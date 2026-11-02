@@ -12,7 +12,7 @@ from test_tokopt import fake_home, proc, sess, NOW, kill_env, run, ledger  # noq
 from tokopt import cli as tokopt
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 POL = {"session_idle_hours": 8, "protect": []}
 
 

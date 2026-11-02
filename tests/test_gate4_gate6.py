@@ -95,7 +95,7 @@ def test_lock_file_symlink_is_refused_with_a_clear_message(fake_home, monkeypatc
 # ---------- N4: the plist runs python isolated ----------
 
 def test_plist_python_arguments_start_with_dash_I():
-    s = (ROOT / "scripts/install-tokopt-launchd.sh").read_text()
+    s = (ROOT / "tokopt/install-tokopt-launchd.sh").read_text()
     assert 'set -- "${py}" -I -m tokopt apply --scheduled' in s
 
 

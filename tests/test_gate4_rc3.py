@@ -15,7 +15,7 @@ from test_gate4 import FIX, hermes_home, hermes_names  # noqa: F401
 from tokopt import cli as tokopt
 
 ROOT = Path(__file__).resolve().parent.parent
-INSTALLER = ROOT / "scripts/install-tokopt-launchd.sh"
+INSTALLER = ROOT / "tokopt/install-tokopt-launchd.sh"
 
 
 def sh(tmp_path, body: str) -> subprocess.CompletedProcess:
