@@ -1048,6 +1048,16 @@ def test_the_record_keeps_the_newest_entries_when_it_is_full():
     assert "/v0/tokopt-nudge" not in wiz._recorded()  # the oldest is
 
 
+def test_reading_a_record_that_is_over_the_cap_keeps_the_newest_entries():
+    n = wiz.RECORD_MAX
+    seeded = [f"/old{i}/tokopt-nudge" for i in range(n + 1)]  # what an earlier build could leave behind
+    rec = h() / ".local/state/tokopt/setup-hook.json"
+    rec.parent.mkdir(parents=True)
+    rec.write_text(json.dumps({"commands": seeded}))
+    got = wiz._recorded()
+    assert len(got) == n and got[-1] == seeded[-1] and seeded[0] not in got
+
+
 def test_output_is_flushed_before_the_installer_subprocess_runs(monkeypatch):
     flushed = []
 
@@ -1062,6 +1072,21 @@ def test_output_is_flushed_before_the_installer_subprocess_runs(monkeypatch):
     monkeypatch.setattr(wiz, "_run_installer", REAL_RUN_INSTALLER)
     assert wiz._run_installer("--status") == 0
     assert seen and seen[0] >= 2  # stdout and stderr were both flushed first, so piped output keeps its order
+
+
+def test_a_registered_directory_that_is_already_deleted_is_not_a_leftover(tmp_path):
+    import conftest
+    gone = str(tmp_path / "tokopt-test-gone")
+    conftest.CREATED_TEMP_DIRS.add(gone)
+    try:
+        assert conftest.leftover_temp_dirs() == []
+    finally:
+        conftest.CREATED_TEMP_DIRS.discard(gone)
+
+
+def test_safe_tmp_registers_the_directory_it_creates(safe_tmp):
+    import conftest
+    assert str(safe_tmp) in conftest.CREATED_TEMP_DIRS and safe_tmp.is_dir()
 
 
 def test_the_leftover_check_only_looks_at_directories_this_run_created(tmp_path):
