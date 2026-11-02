@@ -19,7 +19,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
-from typing import cast
+from typing import Callable, Collection, cast
 
 from tokopt import cli
 from tokopt.cli import NoChange, _tilde, atomic_write, claude_dir, home, mask
@@ -72,20 +72,40 @@ def _tokens(command: object) -> list[str]:
 _PYTHON = re.compile(r"python[\d.]*")
 
 
-def _classify(command: object, ours: str) -> str:
-    """One classifier for every hook decision: "ours" (exactly what we would write now, or the same file), "stale"
-    (provably tokopt's but out of date: `<absolute python> [-I] -m tokopt.nudge`, whichever interpreter, or an
-    absolute `.../tokopt-nudge` that no longer exists) or "foreign" (everything else, never edited or removed: bare
-    names and `~`/`$HOME`/`VAR=1 prog` forms are resolved by a shell at run time, so we cannot judge them; wrappers;
-    a `tokopt-nudge` that still exists elsewhere)."""
+def _installation_nudge() -> str | None:
+    """Real path of the tokopt-nudge that belongs to this installation (absolute PATH entries, then next to this
+    interpreter). Identification only: nothing is trusted or written because of it."""
+    for d in [*os.environ.get("PATH", "").split(os.pathsep), os.path.dirname(os.path.abspath(sys.executable))]:
+        c = os.path.join(d, "tokopt-nudge")
+        if os.path.isabs(d) and os.path.isfile(c):
+            return os.path.realpath(c)
+    return None
+
+
+def _classify(command: object, current: str | None, recorded: Collection[str] = ()) -> str:
+    """One classifier for every hook decision.
+    "ours": exactly the command we would write now (or the same file as it).
+    "stale": ours or provably tokopt's but not the current command: a command setup recorded when it installed it,
+    an absolute `<python> [-I] -m tokopt.nudge` (whichever interpreter), an absolute `.../tokopt-nudge` that no longer
+    exists, or an absolute single-token `.../tokopt-nudge` that is this installation's own file (a hook written by a
+    build that kept no record).
+    "foreign": everything else, never edited or removed: bare and relative names, `~`/`$HOME`/`VAR=1 prog` forms
+    (a shell resolves them at run time, so we cannot judge them), wrappers, a `tokopt-nudge` that still exists elsewhere.
+    Nothing relative is ever resolved against the current directory, and an empty command matches nothing."""
+    if not isinstance(command, str) or not command.strip() or "\x00" in command:
+        return "foreign"
     t = _tokens(command)
-    if command == ours or (len(t) == 1 and len(_tokens(ours)) == 1 and os.path.realpath(t[0]) == os.path.realpath(_tokens(ours)[0])):
+    one = t[0] if len(t) == 1 and os.path.isabs(t[0]) else None
+    if current and (command == current or (one and len(_tokens(current)) == 1 and os.path.isabs(_tokens(current)[0])
+                                           and os.path.realpath(one) == os.path.realpath(_tokens(current)[0]))):
         return "ours"
+    if command in recorded:
+        return "stale"
     if not t or not os.path.isabs(t[0]):
         return "foreign"
     if _PYTHON.fullmatch(Path(t[0]).name) and t[1:] in (["-m", "tokopt.nudge"], ["-I", "-m", "tokopt.nudge"]):
         return "stale"
-    if len(t) == 1 and Path(t[0]).name == "tokopt-nudge" and not os.path.exists(t[0]):
+    if one and Path(one).name == "tokopt-nudge" and (not os.path.exists(one) or os.path.realpath(one) == _installation_nudge()):
         return "stale"
     return "foreign"
 
@@ -122,10 +142,10 @@ def _settings_obj(text: str) -> dict:
     return data
 
 
-def stale_hooks(text: str, command: str) -> list[str]:
-    """Commands of tokopt hooks registered in settings.json whose program is gone (see _classify)."""
+def stale_hooks(text: str, command: str | None, recorded: Collection[str] = ()) -> list[str]:
+    """Commands of tokopt hooks registered in settings.json that are out of date (see _classify)."""
     lst = _event_list(_settings_obj(text), create=False) or []
-    return [h["command"] for h in _commands(lst) if _classify(h.get("command"), command) == "stale"]
+    return [h["command"] for h in _commands(lst) if _classify(h.get("command"), command, recorded) == "stale"]
 
 
 def _drop(lst: list, pred) -> None:
@@ -140,15 +160,20 @@ def _drop(lst: list, pred) -> None:
                 lst.remove(e)
 
 
-def hook_add(text: str, command: str, replace_stale: bool = False) -> str:
-    """Append our hook. NoChange if it is already there. With replace_stale, the first stale tokopt hook is rewritten
-    in place to `command` (and further stale ones dropped) instead of a new entry being added."""
+def hook_add(text: str, command: str, replace_stale: bool = False, recorded: Collection[str] = ()) -> str:
+    """Make `command` the one tokopt hook. NoChange only if nothing at all would change. With replace_stale, out of
+    date tokopt hooks are rewritten in place (the first) or dropped (the rest), also when the current command is
+    already registered next to them."""
     data = _settings_obj(text)
     lst = cast(list, _event_list(data, create=True))
-    if any(_classify(h.get("command"), command) == "ours" for h in _commands(lst)):
+    kind = lambda h: _classify(h.get("command"), command, recorded)  # noqa: E731
+    present = any(kind(h) == "ours" for h in _commands(lst))
+    stale = [h for h in _commands(lst) if kind(h) == "stale"] if replace_stale else []
+    if present and not stale:
         raise NoChange("the nudge hook is already installed")
-    stale = [h for h in _commands(lst) if _classify(h.get("command"), command) == "stale"] if replace_stale else []
-    if stale:
+    if present:
+        _drop(lst, lambda h: any(h is s for s in stale))
+    elif stale:
         keep = stale[0]
         keep["command"] = command
         _drop(lst, lambda h: h is not keep and h in stale)
@@ -157,11 +182,12 @@ def hook_add(text: str, command: str, replace_stale: bool = False) -> str:
     return cli._dump_json(data, text)
 
 
-def hook_remove(text: str, command: str) -> str:
-    """Remove our hook and stale tokopt hooks; any other hook, including a user's own tokopt-nudge, stays."""
+def hook_remove(text: str, command: str | None, recorded: Collection[str] = ()) -> str:
+    """Remove our hook (the command setup recorded, the current one if any) and stale tokopt hooks; any other hook
+    stays. `command` is never derived from a fresh trust check: uninstall must work when none is available."""
     data = _settings_obj(text)
     lst = _event_list(data, create=False)
-    mine = lambda h: _classify(h.get("command"), command) != "foreign"  # noqa: E731
+    mine = lambda h: _classify(h.get("command"), command, recorded) != "foreign"  # noqa: E731
     if lst is None or not any(mine(h) for h in _commands(lst)):
         raise NoChange("the nudge hook is not installed")
     _drop(lst, mine)
@@ -172,63 +198,73 @@ def hook_remove(text: str, command: str) -> str:
     return cli._dump_json(data, text)
 
 
-REFUSALS: list[str] = []   # why candidate programs were refused during the last nudge_command(), for the error message
-
-
-def _safe_exe(p: str) -> str | None:
-    """The RESOLVED real path of program `p`, or None. One trust implementation, the launchd installer's
-    `pinned_exe` (sourced from the packaged script, never copied): absolute path; every symlink hop, the real file and
-    every directory up to / owned by you or root and not group/world writable (a sticky world-writable /tmp does not
-    pass); the shebang interpreter, and the target of a pip exec wrapper, get the same check; `#!/usr/bin/env` is
-    refused. The hook then names the real path, so the file that was checked is the file that runs."""
+def _safe_exe(p: str, why: list[str] | None = None) -> str | None:
+    """The RESOLVED real path of program `p`, or None (reasons appended to `why`). One trust implementation, the
+    launchd installer's `pinned_exe` (sourced from the packaged script, never copied): absolute path; every symlink
+    hop, the real file and every directory up to / owned by you or root and not group/world writable (a sticky
+    world-writable /tmp does not pass); the shebang interpreter, and the target of a pip exec wrapper, get the same
+    check; `#!/usr/bin/env` is refused. The hook then names the real path, so the file checked is the file that runs."""
+    why = [] if why is None else why
     inst = _installer_path()
     if not os.path.isabs(p) or "\n" in p or not inst.is_file():
+        why.append(f"Refusing: {p!r} is not an absolute path to an existing program")
         return None
     try:
         r = subprocess.run(["/bin/bash", "-c", 'source "$1" && pinned_exe "$2"', "_", str(inst), p], capture_output=True,
                            text=True, timeout=30, env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home())})
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as e:
+        why.append(f"Refusing: could not check {p} ({type(e).__name__}: {e})")
         return None
-    out = r.stdout.strip()
+    out = r.stdout.removesuffix("\n")  # not strip(): a real path may end in a space
     if r.returncode == 0 and os.path.isabs(out) and "\n" not in out:
         return out
-    REFUSALS.extend(ln for ln in r.stderr.splitlines() if ln.startswith("Refusing"))
+    why.extend(ln for ln in r.stderr.splitlines() if ln.startswith("Refusing"))
     return None
 
 
-def _console_script(name: str) -> str | None:
+def _console_script(name: str, why: list[str] | None = None) -> str | None:
     """Safe real path of a console script: ABSOLUTE PATH entries only ('.', '' and relative entries mean the
     current directory, i.e. whatever repository the hook later runs in), then next to this interpreter."""
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        if os.path.isabs(d) and os.path.lexists(os.path.join(d, name)) and (p := _safe_exe(os.path.join(d, name))):
+    for d in [*os.environ.get("PATH", "").split(os.pathsep), os.path.dirname(os.path.abspath(sys.executable))]:
+        c = os.path.join(d, name)
+        if os.path.isabs(d) and os.path.lexists(c) and (p := _safe_exe(c, why)):
             return p
-    sib = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), name)
-    return _safe_exe(sib) if os.path.lexists(sib) else None
+    return None
 
 
-def _can_import_nudge(py: str) -> bool:
-    try:
-        return subprocess.run([py, "-I", "-c", "import tokopt.nudge"], cwd="/", shell=False, timeout=10,
-                              capture_output=True).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+def nudge_command(why: list[str] | None = None) -> str | None:
+    """The exact hook command to register: the quoted real path of a safe `tokopt-nudge` console script, or None.
+    There is deliberately no interpreter fallback: `realpath(python)` of a venv/pipx interpreter loses the venv's
+    site-packages, so `<python> -I -m tokopt.nudge` could not import tokopt. Install with pipx instead."""
+    exe = _console_script("tokopt-nudge", why)
+    return shlex.quote(exe) if exe else None
 
 
-def nudge_command() -> str | None:
-    """The exact hook command to register, or None when nothing safe exists. The interpreter fallback uses -I (a
-    `tokopt/` directory in the prompt's cwd cannot shadow the package) and is used only if that interpreter can
-    actually import tokopt."""
-    REFUSALS.clear()
-    if (exe := _console_script("tokopt-nudge")):
-        return shlex.quote(exe)
-    py = _safe_exe(sys.executable)
-    if py and not _can_import_nudge(py):
-        REFUSALS.append(f"Refusing: {py} cannot import tokopt (a pipx/venv Python must be used)")
-        return None
-    return f"{shlex.quote(py)} -I -m tokopt.nudge" if py else None
+def _record_path() -> Path:
+    return cli.state_dir() / "setup-hook.json"
 
 
-def _edit_settings(path: Path, fn, create: bool) -> None:
+def _recorded() -> list[str]:
+    """The exact hook commands setup wrote (state file, never read through a symlink). Uninstall removes these, so
+    it never has to re-derive 'ours' from a fresh trust check that may now say something else or nothing."""
+    d = cli._read_state_json(_record_path(), None)
+    c = d.get("commands") if isinstance(d, dict) else None
+    return [x for x in c if isinstance(x, str)] if isinstance(c, list) else []
+
+
+def _record(cmd: str) -> None:
+    cmds = _recorded()
+    if cmd not in cmds:
+        cmds.append(cmd)
+    cli.private_dir(cli.state_dir())
+    atomic_write(_record_path(), json.dumps({"commands": cmds}).encode(), 0o600, follow=False)
+
+
+def _forget() -> None:
+    _record_path().unlink(missing_ok=True)
+
+
+def _edit_settings(path: Path, fn, create: bool, after: Callable[[], None] | None = None) -> None:
     """Backup (0600), edit atomically (mode preserved), then re-read: the file on disk must be valid JSON.
     Symlinks are followed like every agent config edit (dotfile managers link settings.json): the TARGET is replaced
     atomically and the link stays, but only if the target is a regular file owned by you."""
@@ -250,6 +286,11 @@ def _edit_settings(path: Path, fn, create: bool) -> None:
                 raise OSError(f"{os.path.realpath(path)} is not a regular file owned by you; refusing to edit it")
             _, _, bk = cli.edit_file(path, checked, cli.backup_writer(path, time.strftime("%Y%m%dT%H%M%S"), uuid.uuid4().hex[:8]))
             say(f"backup: {_tilde(str(bk))}")
+        if after:
+            try:
+                after()  # bookkeeping inside the same lock, only once the edit has landed
+            except OSError as e:
+                say(f"  warning: could not update the setup record {_tilde(str(_record_path()))} ({e.strerror or e})")
     json.loads(path.read_text())  # the end state on disk, not our buffer
 
 
@@ -298,12 +339,24 @@ def _installer_path() -> Path:
     return Path(str(importlib.resources.files("tokopt") / "install-tokopt-launchd.sh"))
 
 
+_DROP_ENV = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "IFS", "PS4")
+
+
+def _clean_env() -> dict[str, str]:
+    """The environment for bash: nothing that makes a non-interactive bash run foreign code or change its parsing
+    (BASH_ENV, exported functions, loader variables), PATH reduced to absolute entries. The rest (HOME,
+    CLAUDE_CONFIG_DIR, CODEX_HOME, ...) is kept: the installer forwards it into the job."""
+    env = {k: v for k, v in os.environ.items() if k not in _DROP_ENV and not k.startswith(("BASH_FUNC_", "LD_", "DYLD_"))}
+    env["PATH"] = os.pathsep.join(d for d in env.get("PATH", "").split(os.pathsep) if os.path.isabs(d)) or "/usr/bin:/bin"
+    return env
+
+
 def _run_installer(*args: str) -> int:
     p = _installer_path()
     if not p.is_file():
         say(f"The launchd installer is missing from this installation ({p}); reinstall tokopt.")
         return 1
-    return subprocess.run(["/bin/bash", str(p), *args], check=False).returncode
+    return subprocess.run(["/bin/bash", str(p), *args], check=False, env=_clean_env()).returncode
 
 
 def _apply() -> int:
@@ -382,18 +435,21 @@ def _step4(a, found: dict[str, bool]) -> bool:
     if not found["claude"]:
         say("  Claude Code not found: skipped.")
         return True
-    path, cmd = claude_dir() / "settings.json", nudge_command()
+    why: list[str] = []
+    path, cmd = claude_dir() / "settings.json", nudge_command(why)
     if cmd is None:
-        say("  no safe tokopt-nudge program found: it must be reached through absolute PATH entries, and it, every "
-            "symlink hop, every directory above it and its shebang interpreter must be owned by you or root and not "
-            "group/world-writable. Install tokopt with pipx, then re-run `tokopt setup`."
-            + "".join(f"\n    {r}" for r in dict.fromkeys(REFUSALS)))
+        say("  no safe tokopt-nudge console script found: install tokopt with pipx so one exists, then re-run "
+            "`tokopt setup`. It must be reached through absolute PATH entries, and it, every symlink hop, every "
+            "directory above it and its shebang interpreter must be owned by you or root and not group/world-writable."
+            + "".join(f"\n    {r}" for r in dict.fromkeys(why)))
         return False
+    recorded = _recorded()
     say(f"  Adds one {EVENT} entry to {_tilde(str(path))}:\n    {cmd}\n"
         "  (JSON checked before and after; 0600 backup first under ~/.local/state/tokopt/backups; atomic write)")
-    stale = _stale_in(path, cmd)
+    stale = _stale_in(path, cmd, recorded)
     if stale:
-        say("  A tokopt hook is already registered but is out of date (its program no longer exists, or it is the older `python -m` fallback):\n    "
+        say("  A tokopt hook is already registered but is out of date (its program no longer exists, or it is an older "
+            "command setup or a previous version wrote):\n    "
             + "\n    ".join(stale))
     if a.dry_run:
         say("  dry run: not written")
@@ -401,7 +457,8 @@ def _step4(a, found: dict[str, bool]) -> bool:
     if not _confirm(a, "Replace the stale hook?" if stale else "Install the nudge hook?", True):
         return True
     try:
-        _edit_settings(path, lambda t: hook_add(t, cmd, replace_stale=True), create=True)
+        _edit_settings(path, lambda t: hook_add(t, cmd, replace_stale=True, recorded=recorded), create=True,
+                       after=lambda: _record(cmd))
     except NoChange:
         say("  already installed with this command: nothing to do")
     except (ValueError, OSError, RuntimeError) as e:  # cli.Busy is a RuntimeError
@@ -412,9 +469,9 @@ def _step4(a, found: dict[str, bool]) -> bool:
     return True
 
 
-def _stale_in(path: Path, cmd: str) -> list[str]:
+def _stale_in(path: Path, cmd: str, recorded: Collection[str]) -> list[str]:
     try:
-        return stale_hooks(path.read_text(), cmd)
+        return stale_hooks(path.read_text(), cmd, recorded)
     except (OSError, ValueError):
         return []  # unreadable or invalid: the edit step reports it
 
@@ -451,7 +508,11 @@ def _step6(a) -> int:
     if a.dry_run:
         say("  dry run: would ask")
     elif _confirm(a, "Run `tokopt apply` now?", False):
-        return _apply()
+        rc = _apply()
+        if rc == 2:  # the gate was declined (or another tokopt run holds the lock): `apply` already said so, nothing changed
+            say("  apply did not run (declined, or locked by another tokopt run): nothing changed. Re-run `tokopt apply` when ready.")
+            return 0
+        return rc
     else:
         say("  skipped. When you have read the plan: `tokopt apply`")
     return 0
@@ -467,8 +528,8 @@ def _uninstall(a) -> int:
         say(f"  dry run: would remove the tokopt-nudge entry from {_tilde(str(path))} (backup first)")
     elif _confirm(a, f"Remove the tokopt-nudge entry from {_tilde(str(path))}?", True):
         try:
-            ours = nudge_command() or ""
-            _edit_settings(path, lambda t: hook_remove(t, ours), create=False)
+            recorded = _recorded()
+            _edit_settings(path, lambda t: hook_remove(t, None, recorded), create=False, after=_forget)
             say("  removed")
         except NoChange:
             say("  not installed")
