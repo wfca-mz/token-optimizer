@@ -4,6 +4,8 @@
 
 First shareable release. Changes from the pre-review import:
 
+- New `tokopt setup` wizard (`--yes`, `--dry-run`, `--uninstall`): detects agents, creates/edits the policy with validated input, shows the report, installs the context nudge hook into Claude's `settings.json` (idempotent, backed up, JSON-checked before and after, atomic), offers the macOS launchd installer (cron line elsewhere) and the first `apply` through the normal confirmation gate. Non-TTY without `--yes` refuses. Backup creation is now one shared helper (`backup_writer`) used by `park` and `setup`.
+
 - Third-party plugin manifests (`plugin.json`, `.mcp.json`) are read as regular files, at most 1 MiB, the file itself must not be a symlink: a manifest linked to `/dev/zero`, a FIFO, a directory or a huge file makes the plugin `SKIP: unreadable plugin manifest` (never parked) instead of exhausting memory; symlinked `skills/`, `commands/`, `agents/` directories are not walked.
 - Hardening: `scheduled_job_warning` cannot crash on any plist content (NUL path, FIFO, device link, directory, nested); common zero-width, format, bidi and tag characters are masked; plugin `SKILL.md` and session-file reads are regular-file only and capped at 1 MiB; an unusable state directory exits 2 cleanly and an unwritable `first_seen.json` no longer breaks `report`; dev pin pytest 9.0.3.
 - Ledger rows start on a fresh line (a half-written row cannot hide the next one); `apply` stops editing configs once the ledger is not writable; the state-dir preflight runs after the lock and covers the state root, `backups/`, `stopped/` and `backups/<stamp>/` (a link there is refused up front; restore also names a planted backup link); a process row without a uid is not yours; `--check-job` stands alone.

@@ -3,6 +3,7 @@
     tokopt [report]          dry-run table (default; never edits agent configs)
     tokopt apply [--yes]     stop idle sessions, then park, with backups and a ledger
     tokopt restore <id|--all>
+    tokopt setup [--yes] [--dry-run] [--uninstall]   onboarding wizard (tokopt/setup.py)
 
 Every enabled MCP/plugin description rides in every request, so unused ones
 are pure token cost. Parking is reversible: backup file + ledger row, and
@@ -1263,20 +1264,23 @@ def _still_parked(kind: str | None, live: bytes, after: bytes, name: str) -> boo
         return False
 
 
-def park(it: Item, reason: str, stamp: str) -> tuple[str, str]:
-    """-> (status, message); status is `parked` or `reverted-by-host`. Raises RuntimeError/ValueError/OSError."""
-    assert it.path and it.edit
-    path, edit = it.path, it.edit
-    rid = uuid.uuid4().hex[:8]
-
+def backup_writer(path: Path, stamp: str, rid: str) -> Callable[[bytes], Path]:
+    """The `backup` callback for edit_bytes: a 0600 copy of the pre-edit bytes under backups/<stamp>/."""
     def backup(before: bytes) -> Path:
         bdir = state_dir() / "backups" / stamp
         private_dir(bdir)
         bk = bdir / f"{rid}-{path.name}"
         atomic_write(bk, before, 0o600, follow=False)
         return bk
+    return backup
 
-    before, after, bk = edit_file(path, lambda t: edit(t, it.name), backup)
+
+def park(it: Item, reason: str, stamp: str) -> tuple[str, str]:
+    """-> (status, message); status is `parked` or `reverted-by-host`. Raises RuntimeError/ValueError/OSError."""
+    assert it.path and it.edit
+    path, edit = it.path, it.edit
+    rid = uuid.uuid4().hex[:8]
+    before, after, bk = edit_file(path, lambda t: edit(t, it.name), backup_writer(path, stamp, rid))
     kind = edit_kind(edit)
     time.sleep(VERIFY_DELAY)  # a running agent that holds its own copy of the file may write it back
     try:
@@ -1612,16 +1616,18 @@ def _apply_cmd(a, policy: dict, now: float) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="tokopt")
-    ap.add_argument("cmd", nargs="?", choices=["report", "apply", "restore"])
+    ap.add_argument("cmd", nargs="?", choices=["report", "apply", "restore", "setup"])
     ap.add_argument("target", nargs="?")
     ap.add_argument("--all", action="store_true", help="restore: undo every parked item")
     ap.add_argument("--yes", "-y", action="store_true", help="apply: confirm the plan (first apply / changed policy)")
     ap.add_argument("--scheduled", action="store_true", help="apply: unattended run; refuses until a confirmed apply exists")
     ap.add_argument("--check-job", action="store_true", help="print a warning if the installed launchd job's program has vanished")
+    ap.add_argument("--dry-run", action="store_true", help="setup: print every step, write nothing")
+    ap.add_argument("--uninstall", action="store_true", help="setup: remove the nudge hook entry and the launchd job (ledger and backups stay)")
     ap.add_argument("--version", action="version", version=f"tokopt {__version__}")
     a = ap.parse_args(argv)
     if a.check_job:
-        if a.cmd or a.target or a.all or a.yes or a.scheduled:
+        if a.cmd or a.target or a.all or a.yes or a.scheduled or a.dry_run or a.uninstall:
             ap.error("--check-job stands alone")
         if (w := scheduled_job_warning()):
             print(_oneline(mask(w)))
@@ -1631,7 +1637,14 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"unexpected argument {a.target!r} (only `restore` takes a ledger id)")
     if a.cmd == "restore" and not (a.target or a.all):
         ap.error("restore needs <ledger-id|--all>")
+    if (a.dry_run or a.uninstall) and a.cmd != "setup":
+        ap.error("--dry-run and --uninstall belong to `setup`")
+    if a.cmd == "setup" and (a.all or a.scheduled):
+        ap.error("setup takes only --yes, --dry-run and --uninstall")
     try:
+        if a.cmd == "setup":
+            from tokopt import setup  # imported here: setup builds on this module
+            return setup.run(a)
         if a.cmd == "restore":
             with state_lock():
                 return _restore_cmd(a)

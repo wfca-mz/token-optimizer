@@ -11,6 +11,29 @@ pipx install .            # gives you the `tokopt` command
 python -m tokopt report   # or run from a checkout, no install
 ```
 
+## Setup wizard
+
+```
+tokopt setup               # interactive: every step is shown first and can be skipped
+tokopt setup --dry-run     # print every step, write nothing
+tokopt setup --yes         # non-interactive: accept each step's default
+tokopt setup --uninstall   # remove the nudge hook entry and the launchd job
+```
+
+Steps: (1) detect Claude Code, Codex, Hermes and Gemini and say what tokopt can do for each (Gemini is read-only; only Claude sessions are stopped); (2) create or show the policy, optionally editing idle days, session hours, `protect` and `cheap_agents` with validated input (comments in the file are kept; a value that cannot be edited safely is left for you to edit); (3) run the read-only report; (4) add the context nudge hook to Claude's `settings.json` `hooks.UserPromptSubmit` (once: re-running never duplicates it; a 0600 backup goes to `~/.local/state/tokopt/backups` first, the JSON is checked before and after, the write is atomic and keeps the file mode; a `settings.json` that is invalid or not 2-space JSON is refused and left alone). Codex is not offered the hook: Codex registers `UserPromptSubmit` hooks only through plugins and the nudge reads Claude transcripts; (5) on macOS, run `scripts/install-tokopt-launchd.sh` (a source checkout is needed for the installer script); elsewhere print the manual cron line, scheduling is never an error; (6) the first `apply`, through the same code and confirmation marker as `tokopt apply --yes`.
+
+Without a terminal, `setup` refuses unless `--yes` or `--dry-run` is given. `--yes` takes each step's default: yes for the report, the hook and the launchd job, **no for the first `apply`** (it parks things and stops sessions, so run it yourself after reading the plan). `--dry-run` also skips the report, because the report caches scans under the state directory. `--uninstall` keeps the ledger and backups.
+
+## Install on another machine
+
+```
+git clone https://github.com/wfca-mz/token-optimizer && cd token-optimizer
+pipx install .
+tokopt setup               # or `tokopt setup --dry-run` first
+```
+
+Then work as usual; the 03:30 job (macOS) re-runs `apply --scheduled` daily. To remove everything: `tokopt setup --uninstall`, `tokopt restore --all`, `pipx uninstall tokopt`.
+
 ## Use
 
 ```
@@ -83,7 +106,7 @@ Log rotation: the job appends to `~/.local/state/tokopt/logs/tokopt.out.log` and
 
 ## Context nudge (optional)
 
-`tokopt-nudge` (always exits 0) is a Claude `UserPromptSubmit` hook that prints one `/clear` hint when the context exceeds 150k tokens. Add it under `hooks.UserPromptSubmit` in `~/.claude/settings.json`.
+`tokopt-nudge` (always exits 0) is a Claude `UserPromptSubmit` hook that prints one `/clear` hint when the context exceeds 150k tokens. `tokopt setup` adds it under `hooks.UserPromptSubmit` in `~/.claude/settings.json` for you (see Setup wizard); to do it by hand, add an entry whose command is the path of the `tokopt-nudge` console script.
 
 ## Uninstall
 
