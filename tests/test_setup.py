@@ -52,7 +52,10 @@ def safe_tmp():
     """A private (0700) temp dir under the real home, whose whole directory chain the trust check can accept: pytest's
     tmp_path sits under a world-writable /tmp on Linux, which the check refuses by design. Skips when even this
     location is refused (e.g. a 775 user-private-group home). Only this directory is created and removed."""
-    d = Path(tempfile.mkdtemp(prefix="tokopt-test-", dir=REAL_HOME))
+    try:
+        d = Path(tempfile.mkdtemp(prefix="tokopt-test-", dir=REAL_HOME))
+    except OSError as e:
+        pytest.skip(f"cannot create a private temp dir under the home directory: {e}")
     try:
         probe = d / "probe/tokopt-nudge"
         probe.parent.mkdir()
@@ -62,7 +65,7 @@ def safe_tmp():
             pytest.skip("no location with a clean directory chain is available in this environment")
         yield d
     finally:
-        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(d)  # a leftover must fail the test, not accumulate in the home directory
 
 
 @pytest.fixture(autouse=True)
@@ -403,10 +406,10 @@ def test_yes_does_not_apply_by_default(capsys):
 def test_accepting_apply_goes_through_the_confirmation_gate(monkeypatch):
     put_settings()
     tty(monkeypatch, ["n", "n", "n", "n", "y"])
-    argvs, real = [], cli.main
-    monkeypatch.setattr(cli, "main", lambda argv=None: argvs.append(list(argv or [])) or real(argv))
+    argvs, real = [], cli._main
+    monkeypatch.setattr(cli, "_main", lambda argv=None: argvs.append(list(argv or [])) or real(argv))
     monkeypatch.setattr(cli, "_ask", lambda: True)  # the gate's own y/N prompt
-    real(["setup"])
+    cli.main(["setup"])
     assert ["apply"] in argvs and ["apply", "--yes"] not in argvs  # the user must see the plan and answer the gate
     assert (h() / ".local/state/tokopt/confirmed").exists()
 
@@ -781,17 +784,37 @@ def test_empty_or_nul_commands_are_foreign_and_never_raise(weird):
     assert weird in nudges_in_any(wiz.hook_add(text, NUDGE, replace_stale=True))
 
 
-def test_uninstall_removes_the_recorded_command_even_when_no_safe_nudge_can_be_found_now(monkeypatch):
-    p = put_settings()
-    cli.main(["setup", "--yes"])
-    rec = h() / ".local/state/tokopt/setup-hook.json"
-    assert json.loads(rec.read_text()) == {"commands": [NUDGE]} and stat.S_IMODE(rec.stat().st_mode) == 0o600
+def offpath_nudge(monkeypatch, tmp_path) -> Path:
+    """A tokopt-nudge that EXISTS, is not on PATH and not next to sys.executable: only a record can make it ours."""
+    other = script(tmp_path / "other/bin/tokopt-nudge")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert str(other) not in wiz._installation_nudges()
+    return other
+
+
+def test_uninstall_removes_the_recorded_command_which_exists_and_is_found_nowhere_else(monkeypatch, tmp_path):
+    other = offpath_nudge(monkeypatch, tmp_path)
+    p = put_settings(wiz.hook_add(FIXTURE.read_text(), str(other)))
+    # control: with no record this existing, off-PATH file is the user's own and uninstall leaves it alone
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0 and nudges(p) == [str(other)]
+    wiz._record(str(other))
     monkeypatch.setattr(wiz, "_console_script", lambda name, why=None: None)  # nothing resolves any more
     monkeypatch.setattr(sys, "executable", "/some/other/interpreter/python")  # ... and we run from another interpreter
-    assert wiz.nudge_command() is None
     assert cli.main(["setup", "--uninstall", "--yes"]) == 0
     assert nudges(p) == [] and json.loads(p.read_text()) == json.loads(FIXTURE.read_text())
-    assert not rec.exists()  # the record goes with the hook; ledger and backups stay
+    assert not (h() / ".local/state/tokopt/setup-hook.json").exists()  # the record goes with the hook
+
+
+def test_install_replaces_a_recorded_existing_command_in_place(monkeypatch, tmp_path):
+    other = offpath_nudge(monkeypatch, tmp_path)
+    put_settings(wiz.hook_add(FIXTURE.read_text(), str(other)))
+    cli.main(["setup", "--yes"])
+    assert nudges() == [str(other), NUDGE]  # not recorded: an existing file elsewhere is the user's, ours is added next to it
+    put_settings(wiz.hook_add(FIXTURE.read_text(), str(other)))
+    wiz._record(str(other))
+    cli.main(["setup", "--yes"])
+    assert nudges() == [NUDGE]  # recorded: replaced in place, no duplicate
+    assert json.loads((h() / ".local/state/tokopt/setup-hook.json").read_text())["commands"] == [NUDGE, str(other)]
 
 
 def test_uninstall_finds_a_hook_from_a_build_that_kept_no_record_by_its_real_file(monkeypatch, tmp_path):
@@ -801,15 +824,6 @@ def test_uninstall_finds_a_hook_from_a_build_that_kept_no_record_by_its_real_fil
     assert not (h() / ".local/state/tokopt/setup-hook.json").exists()
     assert cli.main(["setup", "--uninstall", "--yes"]) == 0
     assert nudges() == []
-
-
-def test_a_recorded_command_is_replaced_in_place_by_a_later_install():
-    old = "/opt/old-venv/bin/tokopt-nudge"
-    put_settings(wiz.hook_add(FIXTURE.read_text(), old))
-    wiz._record(old)  # simulates an earlier setup run that wrote `old`
-    cli.main(["setup", "--yes"])
-    assert nudges() == [NUDGE]
-    assert json.loads((h() / ".local/state/tokopt/setup-hook.json").read_text())["commands"] == [old, NUDGE]
 
 
 def test_a_symlink_planted_in_the_state_dir_stops_the_install_before_any_edit(capsys):
@@ -869,9 +883,53 @@ def test_no_console_script_stops_the_hook_step_and_says_to_use_pipx(monkeypatch,
 def test_a_declined_apply_gate_is_not_a_wizard_failure(monkeypatch, capsys):
     put_settings()
     tty(monkeypatch, ["n", "n", "n", "n", "y"])
-    monkeypatch.setattr(wiz, "_apply", lambda: 2)
+    monkeypatch.setattr(wiz, "_apply", lambda: None)
     assert cli.main(["setup"]) == 0
     assert "nothing changed" in capsys.readouterr().out
+
+
+def test_the_real_gate_decline_gives_exit_zero_and_standalone_apply_still_exits_two(monkeypatch):
+    put_settings()
+    tty(monkeypatch, ["n", "n", "n", "n", "y"])
+    monkeypatch.setattr(cli, "_ask", lambda: False)
+    assert cli.main(["setup"]) == 0
+    assert cli.main(["apply"]) == 2  # documented exit code of an unconfirmed `tokopt apply`, unchanged
+
+
+def test_apply_failures_other_than_a_decline_keep_the_wizard_non_zero(monkeypatch, capsys):
+    put_settings()
+    state = h() / ".local/state"
+    state.mkdir(parents=True)
+    answers = ["n", "n", "n", "n", "y"]
+
+    # (1) a symlink planted in the state directory (Busy)
+    (state / "tokopt").mkdir()
+    (state / "tokopt/planted").symlink_to(h())
+    tty(monkeypatch, list(answers))
+    assert cli.main(["setup"]) != 0
+    assert "symlink" in capsys.readouterr().out
+    (state / "tokopt/planted").unlink()
+
+    # (2) an unusable state directory: a dangling symlink where the directory should be
+    shutil.rmtree(state / "tokopt")
+    (state / "tokopt").symlink_to(h() / "missing-dir")
+    tty(monkeypatch, list(answers))
+    assert cli.main(["setup"]) != 0
+    (state / "tokopt").unlink()
+
+    # (3) the policy becomes invalid between the wizard's own read and apply's
+    calls = {"n": 0}
+    real = cli.load_policy
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ValueError("policy: broken on purpose")
+        return real()
+    monkeypatch.setattr(cli, "load_policy", flaky)
+    tty(monkeypatch, list(answers))
+    assert cli.main(["setup"]) != 0
+    assert "invalid policy" in capsys.readouterr().out
 
 
 def test_the_installer_runs_with_a_scrubbed_environment(monkeypatch):
@@ -888,6 +946,95 @@ def test_the_installer_runs_with_a_scrubbed_environment(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda cmd, **k: seen.update(k) or subprocess.CompletedProcess(cmd, 0))
     monkeypatch.setattr(wiz, "_run_installer", REAL_RUN_INSTALLER)
     assert wiz._run_installer("--status") == 0 and "BASH_ENV" not in seen["env"]
+
+
+@pytest.mark.parametrize("record", [
+    {"commands": ["bash /home/me/my-hook.sh"]},
+    {"commands": ["tokopt-nudge"]},
+    {"commands": ["/usr/local/bin/my-own-hook"]},
+    {"commands": ["/x/tokopt-nudge --flag"]},
+    {"commands": ["/" + "a" * 5000 + "/tokopt-nudge"]},
+    {"commands": "/x/tokopt-nudge"},
+    {"commands": [1, None, ["/x/tokopt-nudge"]]},
+    ["/x/tokopt-nudge"],
+    "not even an object",
+])
+def test_a_tampered_or_malformed_record_never_makes_a_foreign_hook_ours(record):
+    cmds = ["bash /home/me/my-hook.sh", "tokopt-nudge", "/usr/local/bin/my-own-hook"]
+    text = FIXTURE.read_text()
+    for c in cmds:
+        text = wiz.hook_add(text, c)
+    put_settings(text)
+    rec = h() / ".local/state/tokopt/setup-hook.json"
+    rec.parent.mkdir(parents=True)
+    rec.write_text(json.dumps(record))
+    assert wiz._recorded() == []
+    assert wiz._classify("tokopt-nudge", None, ["tokopt-nudge"]) == "foreign"
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0
+    assert settings().read_text() == text  # nothing of the user's was removed
+    cli.main(["setup", "--yes"])
+    assert set(cmds) <= set(nudges_in_any(settings().read_text()))  # install did not rewrite them either
+
+
+@pytest.mark.parametrize("payload", ["[" * 200000 + "]" * 200000, '{"commands": [' + '"/x/tokopt-nudge",' * 200000 + '"/x/tokopt-nudge"]}',
+                                     '{"commands": ' + "[" * 100000, "\x00\x01", ""])
+def test_a_hostile_record_file_is_read_as_empty_and_does_not_break_install_or_uninstall(payload):
+    put_settings()
+    rec = h() / ".local/state/tokopt/setup-hook.json"
+    rec.parent.mkdir(parents=True)
+    rec.write_text(payload)
+    assert wiz._recorded() == []
+    assert cli.main(["setup", "--yes"]) == 0 and nudges() == [NUDGE]
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0
+
+
+def test_the_shared_state_reader_survives_a_deeply_nested_file():
+    f = h() / "deep.json"
+    f.write_text("[" * 200000 + "]" * 200000)
+    assert cli._read_state_json(f, "dflt") == "dflt"
+
+
+def test_an_already_installed_hook_without_a_record_gets_one_so_uninstall_still_finds_it(monkeypatch, tmp_path):
+    put_settings(wiz.hook_add(FIXTURE.read_text(), NUDGE))
+    assert not (h() / ".local/state/tokopt/setup-hook.json").exists()
+    assert cli.main(["setup", "--yes"]) == 0
+    assert wiz._recorded() == [NUDGE]
+    # later another tokopt-nudge is first on PATH and nothing resolves to NUDGE any more: the record still finds it
+    monkeypatch.setattr(wiz, "_console_script", lambda name, why=None: "/elsewhere/bin/tokopt-nudge")
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0 and nudges() == []
+
+
+def test_uninstall_drops_a_stale_record_when_there_is_no_hook_or_no_settings_file():
+    rec = h() / ".local/state/tokopt/setup-hook.json"
+    put_settings()
+    wiz._record(NUDGE)
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0 and not rec.exists()  # settings has no hook of ours
+    wiz._record(NUDGE)
+    settings().unlink()
+    assert cli.main(["setup", "--uninstall", "--yes"]) == 0 and not rec.exists()  # no settings file at all
+    wiz._record(NUDGE)
+    assert cli.main(["setup", "--uninstall", "--dry-run"]) == 0 and rec.exists()  # dry run changes nothing
+
+
+def test_any_tokopt_nudge_of_this_installation_counts_not_just_the_first_on_path(monkeypatch, tmp_path):
+    first = script(tmp_path / "a/tokopt-nudge")
+    second = script(tmp_path / "b/tokopt-nudge")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(first.parent), str(second.parent)]))
+    assert wiz._installation_nudges() >= {os.path.realpath(first), os.path.realpath(second)}
+    text = wiz.hook_add(FIXTURE.read_text(), str(second))  # no record, second PATH entry
+    assert wiz.hook_remove(text, None) == FIXTURE.read_text()
+
+
+def test_the_installer_environment_has_no_python_variables(monkeypatch, tmp_path):
+    (tmp_path / "evil").mkdir()
+    (tmp_path / "evil/sitecustomize.py").write_text("import builtins; builtins.PWNED = 1\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "evil"))
+    monkeypatch.setenv("PYTHONSTARTUP", "x")
+    probe = [sys.executable, "-c", "import builtins; print(hasattr(builtins, 'PWNED'))"]
+    assert subprocess.run(probe, capture_output=True, text=True, env=dict(os.environ)).stdout.strip() == "True"  # the hazard is real
+    env = wiz._clean_env()
+    assert not [k for k in env if k.startswith("PYTHON")]
+    assert subprocess.run(probe, capture_output=True, text=True, env=env).stdout.strip() == "False"
 
 
 def test_the_fixture_is_canonical_two_space_json():

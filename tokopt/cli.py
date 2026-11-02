@@ -159,7 +159,7 @@ def _read_state_json(p: Path, default: Any = None) -> Any:
     """Read one of tokopt's OWN state files: never through a symlink, regular files only."""
     try:
         return json.loads(_state_bytes(p))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # RecursionError: a hostile deeply nested file is just unreadable
         return default
 
 
@@ -1533,6 +1533,11 @@ def _gate(a, policy: dict, now: float, scopes: set[str], sessions: list[dict]) -
     return True
 
 
+class Declined(Exception):
+    """apply's confirmation gate said no (the plan was printed and nothing changed). Distinct from Busy, an unusable
+    state directory or an invalid policy, which are failures; `main` still turns it into exit code 2 as before."""
+
+
 class Busy(RuntimeError):
     """Another apply/restore holds the state lock."""
 
@@ -1589,7 +1594,7 @@ def _apply_cmd(a, policy: dict, now: float) -> int:
     sessions = idle_sessions(policy, now)
     scopes = {f"{it.agent}:{it.kind}" for it, _ in cands} | ({"session:stop"} if sessions else set())
     if not _gate(a, policy, now, scopes, sessions):
-        return 2
+        raise Declined
     prune_backups(now)
     for m in reconcile_ledger():
         print(_oneline(mask(m)))
@@ -1615,6 +1620,14 @@ def _apply_cmd(a, policy: dict, now: float) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except Declined:
+        return 2  # documented, unchanged: `apply` that was not confirmed exits 2
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """`main` without the Declined mapping, for callers (the setup wizard) that must tell a decline from a failure."""
     ap = argparse.ArgumentParser(prog="tokopt")
     ap.add_argument("cmd", nargs="?", choices=["report", "apply", "restore", "setup"])
     ap.add_argument("target", nargs="?")

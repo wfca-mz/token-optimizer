@@ -72,14 +72,19 @@ def _tokens(command: object) -> list[str]:
 _PYTHON = re.compile(r"python[\d.]*")
 
 
-def _installation_nudge() -> str | None:
-    """Real path of the tokopt-nudge that belongs to this installation (absolute PATH entries, then next to this
-    interpreter). Identification only: nothing is trusted or written because of it."""
+def _candidates(name: str):
+    """Existing candidates for a console script, in lookup order: absolute PATH entries only ('.', '' and relative
+    entries mean the current directory), then next to this interpreter."""
     for d in [*os.environ.get("PATH", "").split(os.pathsep), os.path.dirname(os.path.abspath(sys.executable))]:
-        c = os.path.join(d, "tokopt-nudge")
-        if os.path.isabs(d) and os.path.isfile(c):
-            return os.path.realpath(c)
-    return None
+        c = os.path.join(d, name)
+        if os.path.isabs(d) and os.path.lexists(c):
+            yield c
+
+
+def _installation_nudges() -> set[str]:
+    """Real paths of every tokopt-nudge this installation could be using (all candidates, not just the first on PATH).
+    Identification only: nothing is trusted or written because of it."""
+    return {os.path.realpath(c) for c in _candidates("tokopt-nudge") if os.path.isfile(c)}
 
 
 def _classify(command: object, current: str | None, recorded: Collection[str] = ()) -> str:
@@ -99,13 +104,13 @@ def _classify(command: object, current: str | None, recorded: Collection[str] = 
     if current and (command == current or (one and len(_tokens(current)) == 1 and os.path.isabs(_tokens(current)[0])
                                            and os.path.realpath(one) == os.path.realpath(_tokens(current)[0]))):
         return "ours"
-    if command in recorded:
+    if command in recorded and _valid_record(command):
         return "stale"
     if not t or not os.path.isabs(t[0]):
         return "foreign"
     if _PYTHON.fullmatch(Path(t[0]).name) and t[1:] in (["-m", "tokopt.nudge"], ["-I", "-m", "tokopt.nudge"]):
         return "stale"
-    if one and Path(one).name == "tokopt-nudge" and (not os.path.exists(one) or os.path.realpath(one) == _installation_nudge()):
+    if one and Path(one).name == "tokopt-nudge" and (not os.path.exists(one) or os.path.realpath(one) in _installation_nudges()):
         return "stale"
     return "foreign"
 
@@ -176,7 +181,7 @@ def hook_add(text: str, command: str, replace_stale: bool = False, recorded: Col
     elif stale:
         keep = stale[0]
         keep["command"] = command
-        _drop(lst, lambda h: h is not keep and h in stale)
+        _drop(lst, lambda h: any(h is s for s in stale if s is not keep))
     else:
         lst.append({"hooks": [{"type": "command", "command": command, "timeout": NUDGE_TIMEOUT}]})
     return cli._dump_json(data, text)
@@ -223,11 +228,9 @@ def _safe_exe(p: str, why: list[str] | None = None) -> str | None:
 
 
 def _console_script(name: str, why: list[str] | None = None) -> str | None:
-    """Safe real path of a console script: ABSOLUTE PATH entries only ('.', '' and relative entries mean the
-    current directory, i.e. whatever repository the hook later runs in), then next to this interpreter."""
-    for d in [*os.environ.get("PATH", "").split(os.pathsep), os.path.dirname(os.path.abspath(sys.executable))]:
-        c = os.path.join(d, name)
-        if os.path.isabs(d) and os.path.lexists(c) and (p := _safe_exe(c, why)):
+    """Safe real path of a console script (see _candidates for where it is looked for)."""
+    for c in _candidates(name):
+        if (p := _safe_exe(c, why)):
             return p
     return None
 
@@ -244,12 +247,28 @@ def _record_path() -> Path:
     return cli.state_dir() / "setup-hook.json"
 
 
+RECORD_MAX = 100
+
+
+def _valid_record(cmd: object) -> bool:
+    """Only what nudge_command() can produce: ONE absolute token whose name is tokopt-nudge. A tampered record can
+    therefore never make a user's own hook count as ours."""
+    if not isinstance(cmd, str) or len(cmd) > 4096 or "\x00" in cmd:
+        return False
+    t = _tokens(cmd)
+    return len(t) == 1 and os.path.isabs(t[0]) and Path(t[0]).name == "tokopt-nudge"
+
+
 def _recorded() -> list[str]:
-    """The exact hook commands setup wrote (state file, never read through a symlink). Uninstall removes these, so
-    it never has to re-derive 'ours' from a fresh trust check that may now say something else or nothing."""
-    d = cli._read_state_json(_record_path(), None)
+    """The exact hook commands setup wrote (state file; regular file, never through a symlink, at most 1 MiB).
+    Uninstall removes these, so it never has to re-derive 'ours' from a fresh trust check that may now say something
+    else or nothing. Anything unreadable, hostile (deeply nested, huge, wrong types) or off-shape is ignored."""
+    try:
+        d = json.loads(cli._read_small(_record_path()))
+    except (OSError, ValueError, RecursionError):
+        return []
     c = d.get("commands") if isinstance(d, dict) else None
-    return [x for x in c if isinstance(x, str)] if isinstance(c, list) else []
+    return [x for x in c[:RECORD_MAX] if _valid_record(x)] if isinstance(c, list) else []
 
 
 def _record(cmd: str) -> None:
@@ -262,6 +281,14 @@ def _record(cmd: str) -> None:
 
 def _forget() -> None:
     _record_path().unlink(missing_ok=True)
+
+
+def _forget_quietly() -> None:
+    try:
+        with cli.state_lock():
+            _forget()
+    except (OSError, RuntimeError) as e:
+        say(f"  warning: could not remove the setup record ({getattr(e, 'strerror', None) or e})")
 
 
 def _edit_settings(path: Path, fn, create: bool, after: Callable[[], None] | None = None) -> None:
@@ -344,9 +371,9 @@ _DROP_ENV = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH", "IFS", "PS4")
 
 def _clean_env() -> dict[str, str]:
     """The environment for bash: nothing that makes a non-interactive bash run foreign code or change its parsing
-    (BASH_ENV, exported functions, loader variables), PATH reduced to absolute entries. The rest (HOME,
+    (BASH_ENV, exported functions, loader and PYTHON* variables: the installer runs `python -m tokopt --version`), PATH reduced to absolute entries. The rest (HOME,
     CLAUDE_CONFIG_DIR, CODEX_HOME, ...) is kept: the installer forwards it into the job."""
-    env = {k: v for k, v in os.environ.items() if k not in _DROP_ENV and not k.startswith(("BASH_FUNC_", "LD_", "DYLD_"))}
+    env = {k: v for k, v in os.environ.items() if k not in _DROP_ENV and not k.startswith(("BASH_FUNC_", "LD_", "DYLD_", "PYTHON"))}
     env["PATH"] = os.pathsep.join(d for d in env.get("PATH", "").split(os.pathsep) if os.path.isabs(d)) or "/usr/bin:/bin"
     return env
 
@@ -359,9 +386,14 @@ def _run_installer(*args: str) -> int:
     return subprocess.run(["/bin/bash", str(p), *args], check=False, env=_clean_env()).returncode
 
 
-def _apply() -> int:
-    """Plain `tokopt apply`: the gate prints the plan and asks, and only its `y` writes the confirmed marker."""
-    return cli.main(["apply"])
+def _apply() -> int | None:
+    """Plain `tokopt apply`: the gate prints the plan and asks, and only its `y` writes the confirmed marker.
+    -> its exit code, or None when the gate was declined (nothing changed; not a failure). A busy lock, an unusable
+    state directory or an invalid policy are failures and keep their non-zero code."""
+    try:
+        return cli._main(["apply"])
+    except cli.Declined:
+        return None
 
 
 def _plist() -> Path:
@@ -461,6 +493,11 @@ def _step4(a, found: dict[str, bool]) -> bool:
                        after=lambda: _record(cmd))
     except NoChange:
         say("  already installed with this command: nothing to do")
+        try:  # the hook is ours but may predate the record (an earlier build): record it so uninstall can find it
+            with cli.state_lock():
+                _record(cmd)
+        except (OSError, RuntimeError) as e:
+            say(f"  warning: could not update the setup record ({getattr(e, 'strerror', None) or e})")
     except (ValueError, OSError, RuntimeError) as e:  # cli.Busy is a RuntimeError
         say(f"  {_tilde(str(path))} NOT changed: {e}")
         return False
@@ -509,8 +546,8 @@ def _step6(a) -> int:
         say("  dry run: would ask")
     elif _confirm(a, "Run `tokopt apply` now?", False):
         rc = _apply()
-        if rc == 2:  # the gate was declined (or another tokopt run holds the lock): `apply` already said so, nothing changed
-            say("  apply did not run (declined, or locked by another tokopt run): nothing changed. Re-run `tokopt apply` when ready.")
+        if rc is None:
+            say("  apply was declined at its prompt: nothing changed. Re-run `tokopt apply` when ready.")
             return 0
         return rc
     else:
@@ -524,6 +561,8 @@ def _uninstall(a) -> int:
     rc = 0
     if not path.exists():
         say(f"  {_tilde(str(path))} does not exist: not installed")
+        if not a.dry_run:
+            _forget_quietly()
     elif a.dry_run:
         say(f"  dry run: would remove the tokopt-nudge entry from {_tilde(str(path))} (backup first)")
     elif _confirm(a, f"Remove the tokopt-nudge entry from {_tilde(str(path))}?", True):
@@ -533,6 +572,7 @@ def _uninstall(a) -> int:
             say("  removed")
         except NoChange:
             say("  not installed")
+            _forget_quietly()  # no hook of ours is left: drop the record too
         except (ValueError, OSError, RuntimeError) as e:
             say(f"  {_tilde(str(path))} NOT changed: {e}")
             rc = 1

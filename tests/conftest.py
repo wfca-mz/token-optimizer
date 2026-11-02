@@ -50,6 +50,10 @@ def _private_home(tmp_path_factory, monkeypatch):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    left = sorted(str(p) for p in REAL_HOME.glob("tokopt-test-*"))  # the safe_tmp fixture's directories
+    if left:
+        print("\nTESTS LEFT TEMP DIRECTORIES IN THE REAL HOME (remove them):\n  " + "\n  ".join(left))
+        session.exitstatus = 1
     diff = changes(_BEFORE, snapshot(WATCHED))
     if diff:
         print("\nTESTS TOUCHED THE REAL HOME (tokopt state/config changed during the run):\n  " + "\n  ".join(diff))
